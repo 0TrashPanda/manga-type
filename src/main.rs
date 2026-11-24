@@ -3,6 +3,9 @@
 //!
 //!   manga-type                             open the app
 //!   manga-type read <chapter>              open the app on one chapter
+//!   manga-type add <series#> [chapter#]    add a series to the library like the app does
+//!                                          (from chapter#, default all) and copy it
+//!   manga-type sync                        Sync all, like the app's button
 //!   manga-type series                      list series in Mihon's downloads
 //!   manga-type chapters <series#>          list chapters of a series
 //!   manga-type pull <series#> <chapter#> <dest-dir>
@@ -87,6 +90,32 @@ fn connect() -> Result<Phone, PhoneError> {
     Ok(phone)
 }
 
+/// Run worker commands headlessly (same code as the app's buttons), printing events.
+/// Returns the events of the last command.
+fn run_worker(w: &mut sync::Worker, cmd: sync::Cmd) -> Result<Vec<sync::Ev>, PhoneError> {
+    use sync::Ev;
+    w.send(cmd);
+    let mut out = Vec::new();
+    loop {
+        for ev in w.poll() {
+            match &ev {
+                Ev::Copy { label, index, count, done, total } => {
+                    eprint!("\r  {}/{} {label}  {:.1}/{:.1} MB   ", index + 1, count, *done as f64 / 1e6, *total as f64 / 1e6);
+                    let _ = std::io::stderr().flush();
+                }
+                Ev::Finished(m) => eprintln!("\n{m}"),
+                Ev::Error { message, .. } => return Err(PhoneError::Other(message.clone())),
+                _ => {}
+            }
+            out.push(ev);
+        }
+        if !w.busy() {
+            return Ok(out);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 fn arg_index(args: &[String], i: usize, what: &str) -> Result<usize, PhoneError> {
     args.get(i)
         .and_then(|s| s.parse::<usize>().ok())
@@ -95,6 +124,37 @@ fn arg_index(args: &[String], i: usize, what: &str) -> Result<usize, PhoneError>
 
 fn run(args: &[String]) -> Result<(), PhoneError> {
     match args.first().map(String::as_str) {
+        Some(cmd @ ("add" | "sync")) => {
+            let settings = settings::Settings::load();
+            let library = settings.library.clone();
+            let mut w = sync::Worker::start(eframe::egui::Context::default());
+            let evs = run_worker(&mut w, sync::Cmd::Connect { library: library.clone() })?;
+            let Some(sync::Ev::Connected { series, backup }) = evs.into_iter().find(|e| matches!(e, sync::Ev::Connected { .. })) else {
+                return Err(PhoneError::Other("didn't connect".into()));
+            };
+            eprintln!("connected; Mihon backup: {}", backup.as_deref().unwrap_or("none"));
+            eprintln!("library: {}", library.display());
+            if cmd == "sync" {
+                let lib = library::Library::load(&library);
+                let list = lib.series.iter().map(|s| s.phone_series()).collect();
+                run_worker(&mut w, sync::Cmd::Sync { library, series: list, mode: settings.sync_mode })?;
+            } else {
+                let s = series.get(arg_index(args, 1, "series")?).cloned().ok_or(PhoneError::Other("no such series".into()))?;
+                let start_from = match args.get(2) {
+                    None => None,
+                    Some(_) => {
+                        let i = arg_index(args, 2, "chapter")?;
+                        let evs = run_worker(&mut w, sync::Cmd::Chapters(s.clone()))?;
+                        let Some(sync::Ev::Chapters { chapters, .. }) = evs.into_iter().find(|e| matches!(e, sync::Ev::Chapters { .. })) else {
+                            return Err(PhoneError::Other("no chapter list".into()));
+                        };
+                        Some(chapters.get(i).ok_or(PhoneError::Other("no such chapter".into()))?.0.file_name.clone())
+                    }
+                };
+                eprintln!("adding {} / {} from {}", s.source, s.title, start_from.as_deref().unwrap_or("the first chapter"));
+                run_worker(&mut w, sync::Cmd::Add { library, series: s, start_from })?;
+            }
+        }
         Some("pages") => {
             let path = args.get(1).ok_or(PhoneError::Other("expected chapter path".into()))?;
             let t = Instant::now();
