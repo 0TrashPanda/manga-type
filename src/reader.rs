@@ -6,9 +6,11 @@
 //! - Current bubble: accent outline (red while a wrong key flashes). Done: faint green.
 //!   Skipped (Tab): dashed grey.
 //! - OCR runs in the background; bubbles appear as bands finish, top first.
+//! - Position (bubble index, done/skipped marks) and stats are saved next to the chapter
+//!   (`library::ChapterProgress`) and restored when it's opened again.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -19,6 +21,7 @@ use eframe::egui::{
 };
 
 use crate::fix::Dictionary;
+use crate::library::ChapterProgress;
 use crate::ocr::{self, BandResult, Bubble, Scan, ScanEvent, Tesseract};
 use crate::pages::Chapter;
 use crate::settings::Settings;
@@ -42,6 +45,14 @@ const WRONG: Color32 = Color32::from_rgb(235, 60, 60);
 const TYPED: Color32 = Color32::from_rgb(120, 215, 140);
 const PENDING_TEXT: Color32 = Color32::from_gray(225);
 const DIM_TEXT: Color32 = Color32::from_gray(140);
+
+/// What the reader asks the app to do.
+pub enum Action {
+    /// Back to the library.
+    Back,
+    /// Open this chapter next.
+    Open(PathBuf),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -79,7 +90,15 @@ pub struct Reader {
     typing: Option<Typing>,
     bubble_stats: Stats,
     chapter_stats: Stats,
-    settings: Settings,
+    /// Read by the app after each frame (the case dropdown can change it).
+    pub settings: Settings,
+    /// The chapter after this one, offered when this one is finished.
+    next: Option<PathBuf>,
+    /// A progress file existed when opened (so an empty position is still worth saving).
+    had_progress: bool,
+    finished: bool,
+    /// Scroll to the restored bubble once its position is known.
+    restore_pending: bool,
 
     /// Strip y at the top of the viewport.
     scroll: f32,
@@ -132,7 +151,7 @@ fn spawn_loader(ch: Arc<Chapter>, ctx: egui::Context) -> (mpsc::Sender<usize>, m
 }
 
 impl Reader {
-    pub fn new(ch: Arc<Chapter>, ctx: egui::Context) -> Self {
+    pub fn new(ch: Arc<Chapter>, ctx: egui::Context, settings: Settings, next: Option<PathBuf>) -> Self {
         let (load_tx, loaded_rx) = spawn_loader(ch.clone(), ctx.clone());
 
         // The correction dictionary takes a moment to load; typing waits for it so the
@@ -159,7 +178,11 @@ impl Reader {
             typing: None,
             bubble_stats: Stats::default(),
             chapter_stats: Stats::default(),
-            settings: Settings::load(),
+            settings,
+            next,
+            had_progress: false,
+            finished: false,
+            restore_pending: false,
             scroll: 0.0,
             start_scroll: 0.0,
             view_h: 1000.0,
@@ -172,6 +195,20 @@ impl Reader {
             ctx: ctx.clone(),
         };
 
+        // A finished chapter opens from the start again ("Read again"); otherwise resume.
+        if let Some(p) = ChapterProgress::load(&ch.path).filter(|p| !p.finished) {
+            r.had_progress = true;
+            r.current = p.current;
+            r.states = p
+                .states
+                .chars()
+                .map(|c| if c == 's' { State::Skipped } else { State::Done })
+                .collect();
+            r.states.resize(r.current, State::Done);
+            r.chapter_stats = p.stats;
+            r.restore_pending = r.current > 0;
+        }
+
         if let Some(cache) = ocr::load_cache(&ch) {
             for b in &cache.bubbles {
                 if let Some(e) = &b.edited {
@@ -183,7 +220,7 @@ impl Reader {
             let tess = Tesseract::default();
             match tess.check() {
                 Ok(()) => {
-                    let scan = Scan::start(ch, Arc::new(tess), ocr::default_workers());
+                    let scan = Scan::start(ch, Arc::new(tess), r.settings.ocr_workers());
                     r.bands_total = scan.bands.len();
                     r.scan = Some(scan);
                 }
@@ -214,7 +251,10 @@ impl Reader {
         };
         let raw = self.with_edits(raw);
         self.bubbles = ocr::finish(&self.ch, &raw, self.dict.as_deref());
-        self.states.resize(self.bubbles.len(), State::Todo);
+        // Never shrink: restored marks may run ahead of a scan that's still going.
+        if self.states.len() < self.bubbles.len() {
+            self.states.resize(self.bubbles.len(), State::Todo);
+        }
 
         // Keep the current bubble's typing unless nothing is typed yet and its text changed.
         let target = self.bubbles.get(self.current).map(|b| b.target().to_string());
@@ -323,6 +363,42 @@ impl Reader {
         self.bubble_stats = Stats::default();
         self.current += 1;
         self.typing = self.bubbles.get(self.current).map(|b| self.new_typing(b.target()));
+        self.save_progress();
+    }
+
+    fn total_stats(&self) -> Stats {
+        let mut total = self.chapter_stats.clone();
+        total.merge(&self.bubble_stats);
+        total
+    }
+
+    /// Save position and stats next to the chapter.
+    pub fn save_progress(&mut self) {
+        let stats = self.total_stats();
+        if !self.had_progress && self.current == 0 && stats.correct + stats.wrong == 0 {
+            return; // opened and closed without typing: leave no file behind
+        }
+        let states = self.states[..self.current.min(self.states.len())]
+            .iter()
+            .map(|s| if *s == State::Skipped { 's' } else { 'd' })
+            .collect();
+        let mut p = ChapterProgress {
+            current: self.current,
+            states,
+            bubbles: if self.raw_done.is_some() { self.bubbles.len() } else { 0 },
+            finished: self.finished,
+            stats,
+            updated: 0,
+        };
+        match p.save(&self.ch.path) {
+            Ok(()) => self.had_progress = true,
+            Err(e) => self.notice = Some(format!("Couldn't save your position: {e}")),
+        }
+    }
+
+    /// All bubbles typed or skipped and the scan is complete.
+    fn at_end(&self) -> bool {
+        self.raw_done.is_some() && self.dict_rx.is_none() && self.current >= self.bubbles.len()
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -476,7 +552,8 @@ impl Reader {
         job
     }
 
-    fn draw_bar(&mut self, ui: &mut egui::Ui) {
+    fn draw_bar(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+        let mut action = None;
         ui.add_space(8.0);
         let done = self.current >= self.bubbles.len();
         let scanning = self.raw_done.is_none() && self.scan.is_some();
@@ -493,23 +570,38 @@ impl Reader {
                     .color(DIM_TEXT),
             );
         } else {
-            let mut total = self.chapter_stats.clone();
-            total.merge(&self.bubble_stats);
-            ui.label(
-                egui::RichText::new(format!(
-                    "Chapter finished — {:.0} WPM, {:.1}% accuracy",
-                    total.wpm(),
-                    total.accuracy()
-                ))
-                .size(20.0)
-                .color(TYPED),
-            );
+            let total = self.total_stats();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Chapter finished — {:.0} WPM, {:.1}% accuracy",
+                        total.wpm(),
+                        total.accuracy()
+                    ))
+                    .size(20.0)
+                    .color(TYPED),
+                );
+                if let Some(next) = &self.next {
+                    let name = next.file_name().map(|n| crate::phone::display_name(&n.to_string_lossy())).unwrap_or_default();
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new(format!("Next: {name}  (Enter)")).size(16.0)).fill(Color32::from_rgb(70, 110, 60)))
+                        .clicked()
+                    {
+                        action = Some(Action::Open(next.clone()));
+                    }
+                } else {
+                    ui.label(egui::RichText::new("No next chapter on this PC yet.").color(DIM_TEXT));
+                }
+            });
         }
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            let mut total = self.chapter_stats.clone();
-            total.merge(&self.bubble_stats);
+            if ui.button("← Library").on_hover_text("Back to the library (Esc). Your place is saved.").clicked() {
+                action = Some(Action::Back);
+            }
+            ui.separator();
+            let total = self.total_stats();
             let n = self.bubbles.len();
             let more = if scanning { "+" } else { "" };
             ui.label(format!("Bubble {} / {n}{more}", (self.current + 1).min(n.max(1))));
@@ -547,6 +639,7 @@ impl Reader {
         if let Some(n) = &self.notice {
             ui.label(egui::RichText::new(n).color(WRONG));
         }
+        action
     }
 
     fn draw_edit_dialog(&mut self, ctx: &egui::Context) {
@@ -575,10 +668,16 @@ impl Reader {
     }
 }
 
-impl eframe::App for Reader {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl Reader {
+    pub fn chapter_path(&self) -> &std::path::Path {
+        &self.ch.path
+    }
+
+    /// Draw one frame. Returns what the app should do next, if anything.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let ctx = ui.ctx().clone();
         self.poll_background();
+        let mut action = None;
 
         if self.editing.is_none() {
             // Keys go to typing, not to whatever button was clicked last (Space would press it).
@@ -587,14 +686,37 @@ impl eframe::App for Reader {
                     m.surrender_focus(id);
                 }
             });
-            if self.dict_rx.is_none() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                action = Some(Action::Back);
+            }
+            if self.at_end() {
+                if let Some(next) = &self.next
+                    && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
+                {
+                    action = Some(Action::Open(next.clone()));
+                }
+            } else if self.dict_rx.is_none() {
                 self.handle_keys(&ctx);
             }
         }
 
-        egui::Panel::bottom("bar").exact_size(124.0).show(ui, |ui| self.draw_bar(ui));
+        if self.at_end() && !self.finished {
+            self.finished = true;
+            self.save_progress();
+        }
+
+        if let Some(a) = egui::Panel::bottom("bar").exact_size(124.0).show(ui, |ui| self.draw_bar(ui)).inner {
+            action = Some(a);
+        }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.draw_strip(ui));
         self.draw_edit_dialog(&ctx);
+
+        // Jump straight to a restored position once the bubbles before it are known.
+        if self.restore_pending && self.bubbles.len() >= self.current {
+            self.restore_pending = false;
+            self.start_scroll = self.end_for(self.current - 1);
+            self.scroll = self.start_scroll;
+        }
 
         // Ease toward the target, frame-rate independent.
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
@@ -609,27 +731,17 @@ impl eframe::App for Reader {
         if self.typing.as_ref().is_some_and(|t| t.flashing(FLASH)) {
             ctx.request_repaint_after(FLASH);
         }
+        // OCR workers don't wake the UI themselves: keep polling while a scan runs,
+        // otherwise new bubbles only show up on the next mouse move or key press.
+        if self.scan.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        action
     }
 }
 
-/// Open the reader window on one chapter.
-pub fn run(path: &Path) -> Result<(), String> {
-    let ch = Arc::new(Chapter::open(path)?);
-    let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(format!("manga-type — {title}"))
-            .with_app_id("manga-type")
-            .with_inner_size([1000.0, 1100.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "manga-type",
-        options,
-        Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::new(Reader::new(ch, cc.egui_ctx.clone())))
-        }),
-    )
-    .map_err(|e| e.to_string())
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.save_progress();
+    }
 }

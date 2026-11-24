@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=manga-type
+GenericName=Typing manga reader
+Comment=Read your Mihon manga by retyping every speech bubble
+Exec=@BIN@
+Icon=manga-type
+Terminal=false
+Categories=Graphics;Viewer;
+Keywords=manga;manhwa;webtoon;typing;mihon;
+StartupWMClass=manga-type

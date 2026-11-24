@@ -535,12 +535,12 @@ impl Write for ProgressWriter<'_> {
 // ---------------------------------------------------------------------------
 
 /// Mihon writes `<name>_tmp` folders while a download is in progress.
-fn is_unfinished(name: &str) -> bool {
+pub fn is_unfinished(name: &str) -> bool {
     name.ends_with("_tmp") || name.ends_with(".tmp")
 }
 
 /// `Chapter 337 - Finale (2)_bcc36f.cbz` -> `Chapter 337 - Finale (2)`.
-fn display_name(file_name: &str) -> String {
+pub fn display_name(file_name: &str) -> String {
     let stem = file_name
         .strip_suffix(".cbz")
         .or_else(|| file_name.strip_suffix(".CBZ"))

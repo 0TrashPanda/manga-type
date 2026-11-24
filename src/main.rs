@@ -1,6 +1,8 @@
-//! manga-type. For now a small command-line harness to test the phone layer
-//! against the real phone; the egui app replaces this later.
+//! manga-type. Without arguments it opens the app (library + reader).
+//! The subcommands are test tools for each layer.
 //!
+//!   manga-type                             open the app
+//!   manga-type read <chapter>              open the app on one chapter
 //!   manga-type series                      list series in Mihon's downloads
 //!   manga-type chapters <series#>          list chapters of a series
 //!   manga-type pull <series#> <chapter#> <dest-dir>
@@ -9,15 +11,17 @@
 //!   manga-type pages <chapter.cbz|dir>     page order and strip layout
 //!   manga-type bands <chapter> <out-dir>   write the OCR bands as PNGs
 //!   manga-type ocr <chapter> [annot-dir]   scan a chapter, print bubbles
-//!   manga-type read <chapter>              open the reader window
 
+mod app;
 mod fix;
+mod library;
 mod mihon;
 mod ocr;
 mod pages;
 mod phone;
 mod reader;
 mod settings;
+mod sync;
 mod typing;
 
 /// Debug: write each OCR band with bubble boxes drawn on it (red) and their index.
@@ -137,7 +141,9 @@ fn run(args: &[String]) -> Result<(), PhoneError> {
         }
         Some("read") => {
             let path = args.get(1).ok_or(PhoneError::Other("expected chapter path".into()))?;
-            reader::run(Path::new(path)).map_err(PhoneError::Other)?;
+            let p = Path::new(path);
+            let p = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            app::run(Some(p)).map_err(PhoneError::Other)?;
         }
         Some("ocr") => {
             // ocr <chapter> [annotated-out-dir]
@@ -276,8 +282,14 @@ fn run(args: &[String]) -> Result<(), PhoneError> {
             eprintln!();
             println!("copied to {} in {secs:.1}s ({:.1} MB/s)", out.display(), last as f64 / 1e6 / secs);
         }
+        None => app::run(None).map_err(PhoneError::Other)?,
         _ => {
-            eprintln!("usage: manga-type series | chapters <n> | pull <series#> <chapter#> <dest> | stop-adb");
+            eprintln!(
+                "usage: manga-type                      open the app\n\
+                 \x20      manga-type read <chapter>       open the app on one chapter\n\
+                 \x20      manga-type series | chapters <n> | pull <series#> <chapter#> <dest> | stop-adb\n\
+                 \x20      manga-type progress | pages <chapter> | bands <chapter> <dir> | ocr <chapter> [dir]"
+            );
         }
     }
     Ok(())

@@ -54,6 +54,13 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
   - only chapters after the last one finished in manga-type
 - Phone files are never modified or deleted.
 - Finishing a chapter: offer the next chapter.
+- Implemented (2026-11-24, `src/library.rs`, `src/sync.rs`, `src/app.rs`):
+  - Library folder (setting, default `~/Manga`): `<Source (EN)>/<Series>/<chapter>.cbz`, same names as on the phone. A series = a folder; no separate index.
+  - `<library>/.mihon-backup.tachibk`: copy of the newest Mihon backup, saved on every phone connect, so read/unread markers work without the phone.
+  - `<series>/.manga-type-series.json`: `start_from` (phone file name) picked in the add-series popup; Sync never copies chapters before it.
+  - Chapter order: Mihon's source order when the backup knows every chapter (survives scanlator-prefix changes), else natural sort.
+  - Phone work runs on one background thread that keeps the USB connection and reconnects once if it dropped. Copy progress, Cancel, and the adb-server-busy error with a "Stop adb server" button.
+  - "After last finished" sync mode = phone chapters after the last chapter finished in manga-type.
 
 ## Typing rules
 - Strictness setting (punctuation), **default: strict with keyboard equivalents**:
@@ -100,8 +107,10 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
 
 ## Persistence
 - Local library folder (configurable).
-- Per chapter: OCR cache JSON, last reading position (bubble index + progress), stats.
-- Settings: strictness, library path, sync mode, worker count.
+- Per chapter: OCR cache JSON, last reading position, stats.
+  - `<chapter>.manga-type-progress.json` (`library::ChapterProgress`): current bubble, done/skipped marks, finished flag, chapter totals (correct, wrong, active seconds). Saved after every bubble and when leaving the reader. Not written if you open and close a chapter without typing.
+  - Reopening resumes at the bubble start (not mid-bubble). A finished chapter ("Read again") starts from the first bubble.
+- Settings (`~/.config/manga-type/settings.json`, settings dialog in the library): case, strictness, library path, sync mode, OCR worker count (0 = auto).
 
 ## Stats
 - Live WPM (5 chars = 1 word) and accuracy (correct keystrokes / total keystrokes), per bubble and per chapter. Store per-chapter totals.
@@ -122,6 +131,8 @@ Options (user picks; not decided yet):
 - **sccache**: caches compiled crates across projects and after `cargo clean`.
 
 ## Build order
+Status 2026-11-24: steps 1-8 done in a first version. Not tested against the real phone since step 6 (no phone at hand): Connect, Add series, Sync / Sync all.
+
 1. Phone layer: connect via `adb_client`, list series/chapters under `Books/Tachiyomi/downloads`, pull a chapter with progress, all error states. Test against the real phone.
 2. Mihon backup reader: newest `.tachibk` -> per-series read/unread.
 3. Page loading (cbz + images), natural sort, split-page handling, slicing of tall images.
@@ -130,3 +141,5 @@ Options (user picks; not decided yet):
 6. Library UI: add-series popup, Sync / Sync all, chapter list with Mihon markers, next-chapter offer.
 7. Stats, settings, position memory.
 8. Polish: error states, packaging/launcher.
+   - `manga-type` with no arguments opens the app; `manga-type read <chapter>` opens the app on that chapter. The other subcommands stay as test tools.
+   - `scripts/install.sh`: builds, links `~/.local/bin/manga-type`, installs `packaging/manga-type.desktop` + icon into `~/.local/share` (user only, no sudo). Re-run after `git pull`.
