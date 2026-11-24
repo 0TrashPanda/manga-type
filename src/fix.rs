@@ -305,7 +305,23 @@ fn fix_text(text: &str, dict: &Dictionary, active: &[usize], changed: &mut usize
     out = fix_lone_i(&out, n_alpha, changed);
     // `?` read as `Z`/`2` glued to a word: "THATZ" -> "THAT?", "PROBLEM?Z" -> "PROBLEM?".
     out = fix_question_marks(&out, dict, changed);
-    out
+    trim_stray_marks(&out)
+}
+
+/// Drop a lone mark token at the start or end of a bubble (". AND IS...", "RUMORS? )"):
+/// specks and panel edges that OCR read as punctuation. Keeps `...` and `..`.
+fn trim_stray_marks(text: &str) -> String {
+    let stray = |t: &str| {
+        !t.is_empty() && t.chars().count() <= 2 && t != ".." && t.chars().all(|c| ".,-_~:;()[]{}|'\"`".contains(c))
+    };
+    let mut toks: Vec<&str> = text.split(' ').filter(|t| !t.is_empty()).collect();
+    while toks.len() > 1 && stray(toks[0]) {
+        toks.remove(0);
+    }
+    while toks.len() > 1 && toks.last().is_some_and(|t| stray(t)) {
+        toks.pop();
+    }
+    toks.join(" ")
 }
 
 /// A standalone `1` / `T` / `l` / `|` between words is "I" (but not the T in "SH*T").
@@ -478,4 +494,14 @@ mod tests {
         assert_eq!(fix(&["I WANT A PIE. PIRECTOR!"]), ["I WANT A PIE. DIRECTOR!"]);
         assert_eq!(fix(&["JAZZ QUIZ"]), ["JAZZ QUIZ"]);
     }
+
+    #[test]
+    fn stray_marks_at_bubble_edges() {
+        assert_eq!(trim_stray_marks(". AND IS INSTEAD STUCK"), "AND IS INSTEAD STUCK");
+        assert_eq!(trim_stray_marks("WHAT RUMORS? )"), "WHAT RUMORS?");
+        assert_eq!(trim_stray_marks("... HUH?"), "... HUH?");
+        assert_eq!(trim_stray_marks("WAIT, - NO"), "WAIT, - NO", "only the edges");
+        assert_eq!(trim_stray_marks("."), ".", "never empties a bubble");
+    }
+
 }

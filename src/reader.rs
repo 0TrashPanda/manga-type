@@ -33,6 +33,9 @@ const TILE: u32 = 4096;
 const EASE: f32 = 0.14;
 /// Where the current bubble's centre ends up, as a fraction of viewport height.
 const FOCUS: f32 = 0.38;
+/// A new bubble is first brought at least this far up (its bottom edge, as a fraction of
+/// viewport height), so you never type text that's still off screen.
+const REVEAL: f32 = 0.85;
 /// Padding around a bubble's text box when drawing its highlight (strip px).
 const PAD: f32 = 8.0;
 /// How long a wrong key flashes red.
@@ -342,11 +345,20 @@ impl Reader {
         (cy - FOCUS * self.view_h).clamp(0.0, self.max_scroll())
     }
 
+    /// Smallest scroll position that shows bubble `i` fully, its bottom at [`REVEAL`].
+    fn reveal_for(&self, i: usize) -> f32 {
+        let b = &self.bubbles[i];
+        (b.rect.y1 + PAD - REVEAL * self.view_h).clamp(0.0, self.max_scroll())
+    }
+
     fn target_scroll(&self) -> f32 {
         match (&self.typing, self.current < self.bubbles.len()) {
             (Some(t), true) => {
                 let end = self.end_for(self.current);
-                self.start_scroll + (end - self.start_scroll) * t.progress()
+                // Where the previous bubble left off, but never with this bubble still below
+                // the screen (long art stretches between bubbles): jump there first.
+                let start = self.start_scroll.max(self.reveal_for(self.current)).min(end);
+                start + (end - start) * t.progress()
             }
             // Waiting for OCR or the dictionary: hold still.
             _ => self.start_scroll,
