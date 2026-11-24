@@ -21,7 +21,8 @@ use eframe::egui::{
 use crate::fix::Dictionary;
 use crate::ocr::{self, BandResult, Bubble, Scan, ScanEvent, Tesseract};
 use crate::pages::Chapter;
-use crate::typing::{Stats, Strictness, Typing};
+use crate::settings::Settings;
+use crate::typing::{CaseMode, Stats, Typing};
 
 /// Rows per GPU texture; pages taller than this are split into tiles.
 const TILE: u32 = 4096;
@@ -78,7 +79,7 @@ pub struct Reader {
     typing: Option<Typing>,
     bubble_stats: Stats,
     chapter_stats: Stats,
-    strictness: Strictness,
+    settings: Settings,
 
     /// Strip y at the top of the viewport.
     scroll: f32,
@@ -158,7 +159,7 @@ impl Reader {
             typing: None,
             bubble_stats: Stats::default(),
             chapter_stats: Stats::default(),
-            strictness: Strictness::default(),
+            settings: Settings::load(),
             scroll: 0.0,
             start_scroll: 0.0,
             view_h: 1000.0,
@@ -218,12 +219,12 @@ impl Reader {
         // Keep the current bubble's typing unless nothing is typed yet and its text changed.
         let target = self.bubbles.get(self.current).map(|b| b.target().to_string());
         let stale = match (&self.typing, &target) {
-            (Some(t), Some(text)) => t.pos == 0 && t.chars != crate::typing::normalize(text),
+            (Some(t), Some(text)) => t.pos == 0 && t.chars != crate::typing::target(text, self.settings.case),
             (None, Some(_)) => true,
             _ => false,
         };
         if stale && self.dict_rx.is_none() {
-            self.typing = target.map(|t| Typing::new(&t, self.strictness));
+            self.typing = target.map(|t| self.new_typing(&t));
         }
     }
 
@@ -321,7 +322,7 @@ impl Reader {
         self.chapter_stats.merge(&self.bubble_stats);
         self.bubble_stats = Stats::default();
         self.current += 1;
-        self.typing = self.bubbles.get(self.current).map(|b| Typing::new(b.target(), self.strictness));
+        self.typing = self.bubbles.get(self.current).map(|b| self.new_typing(b.target()));
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -354,11 +355,25 @@ impl Reader {
         }
     }
 
+    fn new_typing(&self, text: &str) -> Typing {
+        Typing::new(text, self.settings.strictness, self.settings.case)
+    }
+
+    /// A setting changed: retarget the current bubble (keeping its progress) and save.
+    fn settings_changed(&mut self) {
+        if let (Some(t), Some(b)) = (&self.typing, self.bubbles.get(self.current)) {
+            self.typing = Some(t.with_settings(b.target(), self.settings.strictness, self.settings.case));
+        }
+        if let Err(e) = self.settings.save() {
+            self.notice = Some(format!("Couldn't save settings: {e}"));
+        }
+    }
+
     fn apply_edit(&mut self, text: String) {
         let Some(b) = self.bubbles.get(self.current) else { return };
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         self.edits.insert(rect_key(b), text.clone());
-        self.typing = Some(Typing::new(&text, self.strictness));
+        self.typing = Some(self.new_typing(&text));
         self.refresh();
         self.save_cache();
     }
@@ -511,6 +526,18 @@ impl Reader {
                 && let Some(b) = self.bubbles.get(self.current)
             {
                 self.editing = Some(b.target().to_string());
+            }
+            ui.separator();
+            let before = self.settings.case;
+            egui::ComboBox::from_id_salt("case-mode")
+                .selected_text(self.settings.case.label())
+                .show_ui(ui, |ui| {
+                    for m in CaseMode::ALL {
+                        ui.selectable_value(&mut self.settings.case, m, m.label());
+                    }
+                });
+            if self.settings.case != before {
+                self.settings_changed();
             }
             if scanning {
                 ui.separator();

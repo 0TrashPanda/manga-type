@@ -56,10 +56,14 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
 - Finishing a chapter: offer the next chapter.
 
 ## Typing rules
-- Strictness setting, **default: strict with keyboard equivalents**:
-  - Lenient: only letters/digits count. Spaces, punctuation, case ignored.
-  - Case-insensitive: spaces and punctuation must be typed.
-  - Strict: exact characters, but keyboard equivalents are accepted: `'` for `’ ‘`, `"` for `“ ”`, `...` for `…`, `-` for `— –`.
+- Strictness setting (punctuation), **default: strict with keyboard equivalents**:
+  - Lenient: only letters/digits count. Spaces and punctuation ignored.
+  - Strict: spaces and punctuation must be typed, but keyboard equivalents are accepted: `'` for `’ ‘`, `"` for `“ ”`, `...` for `…`, `-` for `— –`.
+- Case setting (separate from strictness; dropdown in the reader's bottom bar), **default: first letter capitalized**:
+  - First letter capitalized: all-caps bubbles become sentence case (capital after `.`/`!`/`?`, not after a mid-bubble `...`; `I`, `I'm`, `I'll`, `I'd`, `I've` stay capital) and are typed exactly like that. Bubbles that already have lowercase keep their case. Names come out lowercase mid-sentence (no way to tell them apart yet).
+  - Case sensitive: type the case on the page (all caps).
+  - Case insensitive: any case accepted.
+- Settings are saved to `~/.config/manga-type/settings.json` (`src/settings.rs`).
 - Backspace allowed. Progress and scroll move back with it.
 - Tab skips the current bubble (sound effects, OCR garbage).
 - "Edit text" button to fix a misread bubble before typing it.

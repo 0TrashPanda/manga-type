@@ -17,6 +17,7 @@ mod ocr;
 mod pages;
 mod phone;
 mod reader;
+mod settings;
 mod typing;
 
 /// Debug: write each OCR band with bubble boxes drawn on it (red) and their index.

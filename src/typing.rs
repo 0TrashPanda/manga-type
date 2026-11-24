@@ -4,18 +4,44 @@
 //! become straight ones, `…` becomes `...`, dashes become `-`, runs of spaces become one.
 //! That is how strict mode "accepts keyboard equivalents". Characters a keyboard can't
 //! type at all (`é`, `¥`, `®`) are skipped automatically in every mode.
+//!
+//! Case is its own setting ([`CaseMode`]): exact, ignored, or "first letter capitalized",
+//! which turns ALL-CAPS lettering into sentence case and has you type that.
 
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Strictness {
-    /// Only letters and digits count; spaces, punctuation and case are ignored.
+    /// Only letters and digits count; spaces and punctuation are ignored.
     Lenient,
-    /// Spaces and punctuation must be typed; case is ignored.
-    CaseInsensitive,
-    /// Exact characters (after keyboard normalization).
+    /// Spaces and punctuation must be typed too (after keyboard normalization).
     #[default]
     Strict,
+}
+
+/// How letter case is handled. Separate from [`Strictness`] so any mix works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum CaseMode {
+    /// Type exactly the case on the page (comic lettering: ALL CAPS).
+    Sensitive,
+    /// Any case is accepted.
+    Insensitive,
+    /// All-caps bubbles are turned into sentence case ("Where did you go? I was here.")
+    /// and typed exactly like that. Bubbles that already have lowercase keep their case.
+    #[default]
+    FirstLetter,
+}
+
+impl CaseMode {
+    pub const ALL: [CaseMode; 3] = [CaseMode::FirstLetter, CaseMode::Sensitive, CaseMode::Insensitive];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CaseMode::Sensitive => "Case sensitive",
+            CaseMode::Insensitive => "Case insensitive",
+            CaseMode::FirstLetter => "First letter capitalized",
+        }
+    }
 }
 
 /// What the user types for a bubble's text.
@@ -41,6 +67,76 @@ pub fn normalize(text: &str) -> Vec<char> {
     out
 }
 
+/// What the user types for a bubble's text in the given case mode.
+pub fn target(text: &str, case: CaseMode) -> Vec<char> {
+    let chars = normalize(text);
+    if case == CaseMode::FirstLetter && !chars.iter().any(|c| c.is_lowercase()) {
+        sentence_case(&chars)
+    } else {
+        chars
+    }
+}
+
+/// Lower-case everything, then capitalize the first letter of each sentence (after `.`,
+/// `!` or `?` and a space, but not after `...`, which usually trails into the same
+/// sentence) and the word "I" with its contractions (I'M, I'LL, I'D, I'VE).
+/// Changes letters one for one, so positions in the text stay the same.
+fn sentence_case(chars: &[char]) -> Vec<char> {
+    // One char in, one char out (keeps positions); leave the rare multi-char cases alone.
+    fn single(mut it: impl Iterator<Item = char>, c: char) -> char {
+        match (it.next(), it.next()) {
+            (Some(x), None) => x,
+            _ => c,
+        }
+    }
+    let mut out: Vec<char> = chars.iter().map(|&c| single(c.to_lowercase(), c)).collect();
+    let mut cap_next = true;
+    let mut seen_letter = false;
+    for i in 0..out.len() {
+        let c = out[i];
+        if c.is_alphanumeric() {
+            if cap_next {
+                out[i] = single(c.to_uppercase(), c);
+                cap_next = false;
+            }
+            seen_letter = true;
+        } else if matches!(c, '.' | '!' | '?') {
+            let ellipsis = c == '.' && i >= 2 && out[i - 1] == '.' && out[i - 2] == '.';
+            // `?!` / `!?` / `!!` end a sentence; `...` mid-bubble doesn't ("Wait... what?"),
+            // but a bubble that opens with `...` still starts with a capital.
+            cap_next = !ellipsis || !seen_letter;
+        } else if c == ' ' || c == '"' || c == '\'' || c == '(' || c == '-' {
+            // Keep waiting for the next letter.
+        } else {
+            cap_next = false;
+        }
+        // A digit or letter right after `.` (e.g. "3.5", "U.S.") isn't a new sentence.
+        if seen_letter && matches!(c, '.' | '!' | '?') && out.get(i + 1).is_some_and(|n| n.is_alphanumeric()) {
+            cap_next = false;
+        }
+    }
+    // The pronoun I, alone or as I'm / I'll / I'd / I've.
+    for i in 0..out.len() {
+        if out[i] != 'i' {
+            continue;
+        }
+        let before_ok = i == 0 || !out[i - 1].is_alphanumeric() && out[i - 1] != '\'';
+        let after = out.get(i + 1).copied();
+        let after_ok = match after {
+            None => true,
+            Some('\'') => {
+                let rest: String = out[i + 2..].iter().take_while(|c| c.is_alphabetic()).collect();
+                matches!(rest.as_str(), "m" | "ll" | "d" | "ve")
+            }
+            Some(n) => !n.is_alphanumeric(),
+        };
+        if before_ok && after_ok {
+            out[i] = 'I';
+        }
+    }
+    out
+}
+
 /// Typing state for one bubble.
 #[derive(Debug, Clone)]
 pub struct Typing {
@@ -49,6 +145,7 @@ pub struct Typing {
     /// Which characters must be typed (others are passed over automatically).
     required: Vec<bool>,
     strictness: Strictness,
+    case: CaseMode,
     /// Index of the next character to type (always on a required char, or `chars.len()`).
     pub pos: usize,
     /// When the last wrong key was pressed (for the red flash).
@@ -56,8 +153,8 @@ pub struct Typing {
 }
 
 impl Typing {
-    pub fn new(text: &str, strictness: Strictness) -> Self {
-        let chars = normalize(text);
+    pub fn new(text: &str, strictness: Strictness, case: CaseMode) -> Self {
+        let chars = target(text, case);
         let required = chars
             .iter()
             .map(|c| {
@@ -65,7 +162,7 @@ impl Typing {
                 typeable && (strictness != Strictness::Lenient || c.is_ascii_alphanumeric())
             })
             .collect();
-        let mut t = Self { chars, required, strictness, pos: 0, last_error: None };
+        let mut t = Self { chars, required, strictness, case, pos: 0, last_error: None };
         t.skip_unrequired();
         t
     }
@@ -77,10 +174,20 @@ impl Typing {
     }
 
     fn matches(&self, typed: char, want: char) -> bool {
-        match self.strictness {
-            Strictness::Strict => typed == want,
-            _ => typed.to_lowercase().eq(want.to_lowercase()),
+        match self.case {
+            CaseMode::Insensitive => typed.to_lowercase().eq(want.to_lowercase()),
+            CaseMode::Sensitive | CaseMode::FirstLetter => typed == want,
         }
+    }
+
+    /// Switch settings mid-bubble, keeping what's typed so far.
+    pub fn with_settings(&self, text: &str, strictness: Strictness, case: CaseMode) -> Self {
+        let mut t = Self::new(text, strictness, case);
+        if t.chars.len() == self.chars.len() {
+            t.pos = self.pos;
+            t.skip_unrequired();
+        }
+        t
     }
 
     /// Handle one typed character. Returns `Some(true)` if correct, `Some(false)` if
@@ -197,7 +304,7 @@ mod tests {
 
     #[test]
     fn strict_exact_with_equivalents() {
-        let mut t = Typing::new("DON’T…", Strictness::Strict);
+        let mut t = Typing::new("DON’T…", Strictness::Strict, CaseMode::Sensitive);
         assert_eq!(type_all(&mut t, "don"), [Some(false), Some(false), Some(false)]);
         assert_eq!(t.pos, 0);
         type_all(&mut t, "DON'T...");
@@ -206,16 +313,53 @@ mod tests {
 
     #[test]
     fn case_insensitive_needs_punctuation() {
-        let mut t = Typing::new("HI, YOU.", Strictness::CaseInsensitive);
+        let mut t = Typing::new("HI, YOU.", Strictness::Strict, CaseMode::Insensitive);
         type_all(&mut t, "hi");
         assert_eq!(t.type_char(' '), Some(false), "comma comes first");
-        type_all(&mut t, ", you.");
+        type_all(&mut t, ", yOU.");
         assert!(t.done());
     }
 
     #[test]
+    fn case_sensitive_keeps_caps() {
+        let mut t = Typing::new("HI YOU", Strictness::Strict, CaseMode::Sensitive);
+        assert_eq!(t.type_char('H'), Some(true));
+        assert_eq!(t.type_char('i'), Some(false));
+    }
+
+    fn sc(s: &str) -> String {
+        target(s, CaseMode::FirstLetter).into_iter().collect()
+    }
+
+    #[test]
+    fn first_letter_sentence_case() {
+        assert_eq!(sc("WHERE DID YOU GO? I WAS WAITING."), "Where did you go? I was waiting.");
+        assert_eq!(sc("WAIT... WHAT?! NO WAY!"), "Wait... what?! No way!");
+        assert_eq!(sc("...HUH? I'M FINE, I'LL GO. IT'S 3.5 KM."), "...Huh? I'm fine, I'll go. It's 3.5 km.");
+        assert_eq!(sc("\"HEY.\" (OKAY) - IS IT? HI"), "\"Hey.\" (Okay) - is it? Hi");
+        assert_eq!(sc("Already mixed Case."), "Already mixed Case.", "lowercase present: untouched");
+    }
+
+    #[test]
+    fn first_letter_typed_exactly() {
+        let mut t = Typing::new("NO. YES", Strictness::Strict, CaseMode::FirstLetter);
+        assert_eq!(t.type_char('n'), Some(false));
+        type_all(&mut t, "No. Yes");
+        assert!(t.done());
+    }
+
+    #[test]
+    fn switching_mode_keeps_progress() {
+        let mut t = Typing::new("HELLO THERE", Strictness::Strict, CaseMode::Sensitive);
+        type_all(&mut t, "HELLO ");
+        let t2 = t.with_settings("HELLO THERE", Strictness::Strict, CaseMode::FirstLetter);
+        assert_eq!(t2.pos, 6);
+        assert_eq!(t2.chars.iter().collect::<String>(), "Hello there");
+    }
+
+    #[test]
     fn lenient_letters_only() {
-        let mut t = Typing::new("WHAT?! NO...", Strictness::Lenient);
+        let mut t = Typing::new("WHAT?! NO...", Strictness::Lenient, CaseMode::Insensitive);
         assert_eq!(t.type_char(' '), None);
         type_all(&mut t, "what");
         assert_eq!(t.type_char('?'), None);
@@ -226,7 +370,7 @@ mod tests {
 
     #[test]
     fn backspace_and_progress() {
-        let mut t = Typing::new("AB CD", Strictness::Strict);
+        let mut t = Typing::new("AB CD", Strictness::Strict, CaseMode::Sensitive);
         type_all(&mut t, "AB ");
         assert_eq!(t.progress(), 0.6);
         t.backspace();
@@ -239,7 +383,7 @@ mod tests {
 
     #[test]
     fn untypeable_chars_are_skipped() {
-        let mut t = Typing::new("¥100 CAFÉ", Strictness::Strict);
+        let mut t = Typing::new("¥100 CAFÉ", Strictness::Strict, CaseMode::Sensitive);
         type_all(&mut t, "100 CAF");
         assert!(t.done(), "the É is passed over: {:?}", t.pos);
     }
