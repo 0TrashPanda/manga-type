@@ -24,7 +24,8 @@ pub const BAND_OVERLAP: f32 = 400.0;
 /// Words below this Tesseract confidence are dropped.
 const MIN_WORD_CONF: f32 = 45.0;
 /// Bump when the merge/filter rules change, so old caches get re-scanned.
-const CACHE_VERSION: u32 = 9;
+// 10: second, thresholded OCR pass on dark bands (glowing light-on-dark lettering).
+const CACHE_VERSION: u32 = 10;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -339,14 +340,23 @@ pub fn ocr_band(
         let (w, h) = ((img.width() as f32 * scale) as u32, (img.height() as f32 * scale) as u32);
         img = image::imageops::resize(&img, w, h, image::imageops::FilterType::CatmullRom);
     }
-    let lines = engine
-        .lines(&img)?
-        .into_iter()
-        .map(|mut l| {
-            l.rect = Rect { x0: l.rect.x0 / scale, y0: l.rect.y0 / scale, x1: l.rect.x1 / scale, y1: l.rect.y1 / scale };
-            l
-        })
-        .collect();
+    let unscale = |lines: Vec<Line>| -> Vec<Line> {
+        lines
+            .into_iter()
+            .map(|mut l| {
+                l.rect = Rect { x0: l.rect.x0 / scale, y0: l.rect.y0 / scale, x1: l.rect.x1 / scale, y1: l.rect.y1 / scale };
+                l
+            })
+            .collect()
+    };
+    let mut lines = unscale(engine.lines(&img)?);
+    // Glowing light-on-dark lettering ("IF IT WISHES TO SHINE" over a starry sky) reads as
+    // junk; a hard black/white version of the band reads it fine. Only dark bands get the
+    // second pass (about 1 in 15 on Star-Embracing Swordmaster), so it costs little.
+    if mean_luma(&img) < DARK_BAND_MEAN {
+        let bw = threshold_dark_text(&img);
+        lines = merge_passes(lines, unscale(engine.lines(&bw)?));
+    }
     let top = band.y0.floor();
     let bubbles: Vec<Bubble> = merge_lines(lines)
         .into_iter()
@@ -365,6 +375,42 @@ pub fn ocr_band(
         })
         .collect();
     Ok(BandResult { band: index, bubbles, clipped })
+}
+
+/// Bands darker than this (mean grey, 0-255) also get the thresholded OCR pass.
+const DARK_BAND_MEAN: f32 = 100.0;
+
+fn mean_luma(img: &GrayImage) -> f32 {
+    let n = (img.width() as u64 * img.height() as u64).max(1);
+    img.as_raw().iter().map(|&p| p as u64).sum::<u64>() as f32 / n as f32
+}
+
+/// Bright pixels (>= 60% grey) become black text on white, everything else white.
+fn threshold_dark_text(img: &GrayImage) -> GrayImage {
+    let mut out = img.clone();
+    for p in out.pixels_mut() {
+        p.0[0] = if p.0[0] >= 153 { 0 } else { 255 };
+    }
+    out
+}
+
+/// How much readable text a line holds: letters/digits weighted by confidence.
+fn line_score(l: &Line) -> f32 {
+    l.text.chars().filter(|c| c.is_alphanumeric()).count() as f32 * l.conf
+}
+
+/// Combine the normal and thresholded passes: where they overlap, keep whichever reads
+/// more text with more confidence; lines only one pass found are kept.
+fn merge_passes(mut base: Vec<Line>, extra: Vec<Line>) -> Vec<Line> {
+    for e in extra {
+        let overlaps = |b: &Line| b.rect.intersection(&e.rect) > 0.3 * b.rect.area().min(e.rect.area());
+        let theirs: f32 = base.iter().filter(|b| overlaps(b)).map(line_score).sum();
+        if line_score(&e) > theirs {
+            base.retain(|b| !overlaps(b));
+            base.push(e);
+        }
+    }
+    base
 }
 
 /// Upscale factor before OCR: bring the strip toward ~1600 px wide, at most 2.5x.
@@ -668,4 +714,18 @@ mod tests {
         let out: Vec<_> = combine(&results).into_iter().map(|b| b.text).collect();
         assert_eq!(out, ["A", "WHOLE TEXT", "LEFT", "RIGHT"]);
     }
+
+    #[test]
+    fn thresholded_pass_wins_where_it_reads_more() {
+        let base = vec![line(0.0, 0.0, 100.0, 20.0, "IFIT"), line(0.0, 40.0, 100.0, 60.0, "'HM SHINE")];
+        let extra = vec![
+            line(0.0, 0.0, 120.0, 20.0, "IF IT WISHES"),
+            line(0.0, 40.0, 100.0, 60.0, "TO"),
+            line(0.0, 90.0, 50.0, 100.0, "NEW"),
+        ];
+        let mut texts: Vec<String> = merge_passes(base, extra).into_iter().map(|l| l.text).collect();
+        texts.sort();
+        assert_eq!(texts, ["'HM SHINE", "IF IT WISHES", "NEW"]);
+    }
+
 }

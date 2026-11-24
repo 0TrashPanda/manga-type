@@ -71,11 +71,18 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
   - Case sensitive: type the case on the page (all caps).
   - Case insensitive: any case accepted.
 - Settings are saved to `~/.config/manga-type/settings.json` (`src/settings.rs`).
+- Wrong letters setting (`typing::ErrorMode`, 2026-11-24), **default: block**:
+  - Block: a wrong key flashes red and is rejected.
+  - Must fix: the wrong letter goes in (red); the bubble only finishes once every red letter is backspaced and fixed.
+  - Keep going: the wrong letter goes in (red); each one left when the bubble ends costs one word of net WPM (`Stats::uncorrected`).
 - Backspace allowed. Progress and scroll move back with it.
 - Tab skips the current bubble (sound effects, OCR garbage).
 - "Edit text" button to fix a misread bubble before typing it.
 
 ## Reading / scroll mechanics
+- Scrolling setting (2026-11-24, user's choice), **default: manual**. Typing never moves the page.
+  - Arrows, Page Up/Down, mouse wheel always scroll. j / k / Space (step: page, half, quarter; setting) and Shift+Space scroll only while the current bubble is off screen; once it's on screen those keys type. Typing is blocked while the bubble is off screen (its text is dimmed with a hint).
+  - "Follow typing" keeps the original mechanics below, plus: a bubble is first brought on screen (bottom at 85% of the view) before typing it.
 - Pages stacked vertically in one scroll area, user input scrolling disabled. Only typing moves it.
 - Per bubble: start scroll position = where the previous bubble left off. End position = bubble center at about 38% of viewport height. Scroll target = lerp(start, end, typedChars / totalChars). Ease toward the target each frame (about 0.14 per frame).
 - Bubble highlight: current = accent outline, done = faint green, skipped = dashed grey.
@@ -88,6 +95,7 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
 - Use line-level results, then merge lines into bubbles: sort by y, join a line to a group if the vertical gap is under about 1.3x line height and it overlaps the group horizontally by at least 30%.
 - Filter: word confidence >= 45; words that are mostly stray marks (`|\/_~=<>[]{}`...) dropped, marks trimmed off word ends.
 - Bubble junk filter (`looks_like_text` in `src/ocr.rs`): letters >= 75% of non-punctuation chars, plus 2+ words of 3+ letters at conf >= 60, or a 3+-letter word at conf >= 80, or one shouted word with `!`/`?`/`...` at conf >= 60. On Eleceed ch 1.2: 271 candidates -> 122 kept, nearly all real dialogue; drops some sound effects.
+- Dark bands (mean grey < 100) get a second pass on a thresholded copy (pixels >= 60% grey -> black text on white); where the passes overlap, the line with more letters x confidence wins. Fixes glowing light-on-dark lettering: ASS-style "IF IT WISHES TO SHINE" over a starry sky went from "'HM SHINE" to "IF IT WISHES SHINE", and a whole missed caption was found. About 1 band in 15 on Star-Embracing Swordmaster ch 1. Cache version 10.
 - Upscale bands before OCR toward ~1600 px wide (max 2.5x). On 690 px Eleceed this fixed dropped words and misreads (e.g. "TO" conf 41 -> 87) at ~1.6x the OCR time.
 - Measured (6-core PC, 5 workers): Eleceed 48 bands in ~20 s, Nano Machine 75 bands in ~25 s; first bubbles ready after ~2 s. Cache reload: ~25 ms.
 - Cache holds the **raw** OCR bubbles; `ocr::finish` (ad/credit removal + word correction) runs on every load in milliseconds, so rule changes never need a rescan.

@@ -24,7 +24,7 @@ use crate::fix::Dictionary;
 use crate::library::ChapterProgress;
 use crate::ocr::{self, BandResult, Bubble, Scan, ScanEvent, Tesseract};
 use crate::pages::Chapter;
-use crate::settings::Settings;
+use crate::settings::{ScrollMode, Settings};
 use crate::typing::{CaseMode, Stats, Typing};
 
 /// Rows per GPU texture; pages taller than this are split into tiles.
@@ -36,6 +36,8 @@ const FOCUS: f32 = 0.38;
 /// A new bubble is first brought at least this far up (its bottom edge, as a fraction of
 /// viewport height), so you never type text that's still off screen.
 const REVEAL: f32 = 0.85;
+/// j / k / arrow keys scroll this fraction of the window height.
+const LINE_STEP: f32 = 0.12;
 /// Padding around a bubble's text box when drawing its highlight (strip px).
 const PAD: f32 = 8.0;
 /// How long a wrong key flashes red.
@@ -55,6 +57,8 @@ pub enum Action {
     Back,
     /// Open this chapter next.
     Open(PathBuf),
+    /// Open the settings dialog.
+    Settings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +99,8 @@ pub struct Reader {
     chapter_stats: Stats,
     /// Read by the app after each frame (the case dropdown can change it).
     pub settings: Settings,
+    /// A dialog of the app is open on top: don't take keys.
+    pub paused: bool,
     /// The chapter after this one, offered when this one is finished.
     next: Option<PathBuf>,
     /// A progress file existed when opened (so an empty position is still worth saving).
@@ -105,6 +111,10 @@ pub struct Reader {
 
     /// Strip y at the top of the viewport.
     scroll: f32,
+    /// Where manual scrolling (keys, wheel) is heading; the view eases toward it.
+    manual_target: f32,
+    /// Screen points per strip pixel (from the last frame).
+    scale: f32,
     /// Where the current bubble started from (the previous bubble's end).
     start_scroll: f32,
     /// Viewport height in strip pixels (from the last frame).
@@ -182,11 +192,14 @@ impl Reader {
             bubble_stats: Stats::default(),
             chapter_stats: Stats::default(),
             settings,
+            paused: false,
             next,
             had_progress: false,
             finished: false,
             restore_pending: false,
             scroll: 0.0,
+            manual_target: 0.0,
+            scale: 1.0,
             start_scroll: 0.0,
             view_h: 1000.0,
             tiles: HashMap::new(),
@@ -352,6 +365,9 @@ impl Reader {
     }
 
     fn target_scroll(&self) -> f32 {
+        if self.settings.scroll == ScrollMode::Manual {
+            return self.manual_target;
+        }
         match (&self.typing, self.current < self.bubbles.len()) {
             (Some(t), true) => {
                 let end = self.end_for(self.current);
@@ -371,6 +387,9 @@ impl Reader {
         }
         self.states[self.current] = state;
         self.start_scroll = self.end_for(self.current);
+        if let Some(t) = &self.typing {
+            self.bubble_stats.uncorrected += t.uncorrected();
+        }
         self.chapter_stats.merge(&self.bubble_stats);
         self.bubble_stats = Stats::default();
         self.current += 1;
@@ -413,15 +432,91 @@ impl Reader {
         self.raw_done.is_some() && self.dict_rx.is_none() && self.current >= self.bubbles.len()
     }
 
+    /// Scroll by `amount` strip pixels (manual mode).
+    fn scroll_by(&mut self, amount: f32) {
+        self.manual_target = (self.manual_target + amount).clamp(0.0, self.max_scroll());
+    }
+
+    /// Where the current bubble is relative to the (target) view: `Ordering::Equal` when
+    /// it's on screen, `Less` above, `Greater` below. `None` when there's no current bubble.
+    fn current_placement(&self) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        let b = self.bubbles.get(self.current)?;
+        if self.settings.scroll != ScrollMode::Manual {
+            return Some(Ordering::Equal);
+        }
+        let (top, bottom) = (self.manual_target, self.manual_target + self.view_h);
+        let (y0, y1) = (b.rect.y0 - PAD, b.rect.y1 + PAD);
+        // On screen: fully visible, or (taller than the window) mostly visible.
+        let visible = (y1 - y0) * 0.6;
+        let shown = y1.min(bottom) - y0.max(top);
+        Some(if (y0 >= top - 1.0 && y1 <= bottom + 1.0) || shown >= visible.min(self.view_h * 0.6) {
+            Ordering::Equal
+        } else if y1 <= top + 1.0 || (y0 < top && shown < visible) && b.rect.y0 < top {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        })
+    }
+
+    /// Scrolling keys (manual mode). j / k / Space only scroll while the bubble you're on
+    /// is off screen; once it's in view they type. Returns whether a Text event for a
+    /// Shift+Space should be swallowed.
+    fn handle_scroll_keys(&mut self, ctx: &egui::Context) {
+        if self.settings.scroll != ScrollMode::Manual {
+            return;
+        }
+        let line = LINE_STEP * self.view_h;
+        let page = 0.9 * self.view_h;
+        let space = self.settings.space_step.fraction() * self.view_h;
+        let wheel = ctx.input(|i| i.smooth_scroll_delta.y);
+        if wheel != 0.0 {
+            self.scroll_by(-wheel / self.scale.max(0.01));
+        }
+        let typing_here = !self.at_end() && self.current_placement() == Some(std::cmp::Ordering::Equal);
+        let events = ctx.input(|i| i.events.clone());
+        for ev in &events {
+            match ev {
+                egui::Event::Key { key, pressed: true, modifiers, .. } => match key {
+                    Key::ArrowDown => self.scroll_by(line),
+                    Key::ArrowUp => self.scroll_by(-line),
+                    Key::PageDown => self.scroll_by(page),
+                    Key::PageUp => self.scroll_by(-page),
+                    Key::Home if !typing_here => self.manual_target = 0.0,
+                    Key::End if !typing_here => self.manual_target = self.max_scroll(),
+                    Key::Space if modifiers.shift => self.scroll_by(-space),
+                    _ => {}
+                },
+                egui::Event::Text(t) if !typing_here => {
+                    for c in t.chars() {
+                        match c {
+                            'j' => self.scroll_by(line),
+                            'k' => self.scroll_by(-line),
+                            ' ' if !ctx.input(|i| i.modifiers.shift) => self.scroll_by(space),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context) {
         let (tab, events) = ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::Tab), i.events.clone()));
         if tab {
             self.advance(State::Skipped);
             return;
         }
+        // Manual scrolling: the bubble must be on screen before you type it.
+        if self.current_placement().is_some_and(|p| p != std::cmp::Ordering::Equal) {
+            return;
+        }
+        let shift = ctx.input(|i| i.modifiers.shift);
         for ev in events {
             match ev {
-                egui::Event::Text(text) => {
+                // Shift+Space scrolls up in manual mode; don't also type a space.
+                egui::Event::Text(text) if !(shift && text == " " && self.settings.scroll == ScrollMode::Manual) => {
                     for c in text.chars() {
                         if let Some(t) = &mut self.typing
                             && let Some(ok) = t.type_char(c)
@@ -444,13 +539,22 @@ impl Reader {
     }
 
     fn new_typing(&self, text: &str) -> Typing {
-        Typing::new(text, self.settings.strictness, self.settings.case)
+        Typing::new(text, self.settings.strictness, self.settings.case).errors(self.settings.errors)
+    }
+
+    /// Settings changed in the app's dialog (already saved there).
+    pub fn apply_settings(&mut self, settings: Settings) {
+        self.settings = settings;
+        if let (Some(t), Some(b)) = (&self.typing, self.bubbles.get(self.current)) {
+            self.typing = Some(t.with_settings(b.target(), self.settings.strictness, self.settings.case, self.settings.errors));
+        }
+        self.manual_target = self.scroll;
     }
 
     /// A setting changed: retarget the current bubble (keeping its progress) and save.
     fn settings_changed(&mut self) {
         if let (Some(t), Some(b)) = (&self.typing, self.bubbles.get(self.current)) {
-            self.typing = Some(t.with_settings(b.target(), self.settings.strictness, self.settings.case));
+            self.typing = Some(t.with_settings(b.target(), self.settings.strictness, self.settings.case, self.settings.errors));
         }
         if let Err(e) = self.settings.save() {
             self.notice = Some(format!("Couldn't save settings: {e}"));
@@ -475,6 +579,7 @@ impl Reader {
 
         let width = (rect.width() - 24.0).clamp(100.0, MAX_WIDTH);
         let scale = width / self.ch.strip_width as f32;
+        self.scale = scale;
         self.view_h = rect.height() / scale;
         let x0 = rect.center().x - width / 2.0;
         let to_screen = |x: f32, y: f32| Pos2::new(x0 + x * scale, rect.top() + (y - self.scroll) * scale);
@@ -553,9 +658,23 @@ impl Reader {
         let font = FontId::monospace(20.0);
         let Some(t) = &self.typing else { return job };
         let flashing = t.flashing(FLASH);
+        // Off screen (manual scrolling): dim the text until you scroll to the bubble.
+        let offscreen = self.current_placement().is_some_and(|p| p != std::cmp::Ordering::Equal);
         for (i, c) in t.chars.iter().enumerate() {
-            let mut fmt = TextFormat::simple(font.clone(), if i < t.pos { TYPED } else { PENDING_TEXT });
-            if i == t.pos {
+            let color = if t.is_wrong(i) {
+                WRONG
+            } else if i < t.pos {
+                TYPED
+            } else if offscreen {
+                DIM_TEXT
+            } else {
+                PENDING_TEXT
+            };
+            let mut fmt = TextFormat::simple(font.clone(), color);
+            if t.is_wrong(i) {
+                fmt.underline = Stroke::new(2.0, WRONG);
+            }
+            if i == t.pos && !offscreen {
                 fmt.background = if flashing { WRONG } else { Color32::from_rgba_unmultiplied(255, 170, 40, 90) };
                 fmt.underline = Stroke::new(2.0, ACCENT);
             }
@@ -574,6 +693,20 @@ impl Reader {
             ui.label(egui::RichText::new("Loading dictionary…").color(DIM_TEXT));
         } else if !done {
             let job = self.bubble_text_job(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                match self.current_placement() {
+                    Some(std::cmp::Ordering::Greater) => {
+                        ui.label(egui::RichText::new("▼ scroll down to this bubble (j, Space, ↓, wheel)").color(ACCENT));
+                    }
+                    Some(std::cmp::Ordering::Less) => {
+                        ui.label(egui::RichText::new("▲ scroll up to this bubble (k, Shift+Space, ↑, wheel)").color(ACCENT));
+                    }
+                    _ => {}
+                }
+                if self.typing.as_ref().is_some_and(Typing::needs_fixing) {
+                    ui.label(egui::RichText::new("Fix the red letters (Backspace) to finish this bubble").color(WRONG));
+                }
+            });
             ui.label(job);
         } else if scanning {
             ui.label(
@@ -611,6 +744,9 @@ impl Reader {
         ui.horizontal(|ui| {
             if ui.button("← Library").on_hover_text("Back to the library (Esc). Your place is saved.").clicked() {
                 action = Some(Action::Back);
+            }
+            if ui.button("Settings").clicked() {
+                action = Some(Action::Settings);
             }
             ui.separator();
             let total = self.total_stats();
@@ -691,7 +827,7 @@ impl Reader {
         self.poll_background();
         let mut action = None;
 
-        if self.editing.is_none() {
+        if self.editing.is_none() && !self.paused {
             // Keys go to typing, not to whatever button was clicked last (Space would press it).
             ctx.memory_mut(|m| {
                 if let Some(id) = m.focused() {
@@ -701,6 +837,7 @@ impl Reader {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 action = Some(Action::Back);
             }
+            self.handle_scroll_keys(&ctx);
             if self.at_end() {
                 if let Some(next) = &self.next
                     && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
@@ -728,6 +865,7 @@ impl Reader {
             self.restore_pending = false;
             self.start_scroll = self.end_for(self.current - 1);
             self.scroll = self.start_scroll;
+            self.manual_target = self.start_scroll;
         }
 
         // Ease toward the target, frame-rate independent.

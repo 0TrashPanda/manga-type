@@ -19,6 +19,32 @@ pub enum Strictness {
     Strict,
 }
 
+/// What a wrong key does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ErrorMode {
+    /// A wrong key is rejected: it flashes red and you stay on the letter.
+    #[default]
+    Block,
+    /// The wrong letter goes in (red) and the bubble only finishes once you've
+    /// backspaced and fixed every red letter.
+    Correct,
+    /// The wrong letter goes in (red) and you can go on; each one still wrong when the
+    /// bubble ends costs a word of net WPM.
+    Keep,
+}
+
+impl ErrorMode {
+    pub const ALL: [ErrorMode; 3] = [ErrorMode::Block, ErrorMode::Correct, ErrorMode::Keep];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ErrorMode::Block => "Block wrong keys",
+            ErrorMode::Correct => "Wrong letters stay, must fix them",
+            ErrorMode::Keep => "Wrong letters stay, net WPM penalty",
+        }
+    }
+}
+
 /// How letter case is handled. Separate from [`Strictness`] so any mix works.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CaseMode {
@@ -146,6 +172,9 @@ pub struct Typing {
     required: Vec<bool>,
     strictness: Strictness,
     case: CaseMode,
+    errors: ErrorMode,
+    /// Positions typed wrong and not fixed yet (only in [`ErrorMode::Correct`] / `Keep`).
+    wrong: Vec<bool>,
     /// Index of the next character to type (always on a required char, or `chars.len()`).
     pub pos: usize,
     /// When the last wrong key was pressed (for the red flash).
@@ -162,9 +191,31 @@ impl Typing {
                 typeable && (strictness != Strictness::Lenient || c.is_ascii_alphanumeric())
             })
             .collect();
-        let mut t = Self { chars, required, strictness, case, pos: 0, last_error: None };
+        let wrong = vec![false; chars.len()];
+        let mut t = Self { chars, required, strictness, case, errors: ErrorMode::Block, wrong, pos: 0, last_error: None };
         t.skip_unrequired();
         t
+    }
+
+    /// Set what a wrong key does (default [`ErrorMode::Block`]).
+    pub fn errors(mut self, mode: ErrorMode) -> Self {
+        self.errors = mode;
+        self
+    }
+
+    /// Whether the character at `i` was typed wrong and not fixed.
+    pub fn is_wrong(&self, i: usize) -> bool {
+        self.wrong.get(i).copied().unwrap_or(false)
+    }
+
+    /// Letters typed wrong and not fixed.
+    pub fn uncorrected(&self) -> u64 {
+        self.wrong.iter().filter(|w| **w).count() as u64
+    }
+
+    /// Everything is typed but red letters must be fixed first ([`ErrorMode::Correct`]).
+    pub fn needs_fixing(&self) -> bool {
+        self.errors == ErrorMode::Correct && self.pos >= self.chars.len() && self.uncorrected() > 0
     }
 
     fn skip_unrequired(&mut self) {
@@ -181,10 +232,13 @@ impl Typing {
     }
 
     /// Switch settings mid-bubble, keeping what's typed so far.
-    pub fn with_settings(&self, text: &str, strictness: Strictness, case: CaseMode) -> Self {
-        let mut t = Self::new(text, strictness, case);
+    pub fn with_settings(&self, text: &str, strictness: Strictness, case: CaseMode, errors: ErrorMode) -> Self {
+        let mut t = Self::new(text, strictness, case).errors(errors);
         if t.chars.len() == self.chars.len() {
             t.pos = self.pos;
+            if errors != ErrorMode::Block {
+                t.wrong = self.wrong.clone();
+            }
             t.skip_unrequired();
         }
         t
@@ -193,20 +247,27 @@ impl Typing {
     /// Handle one typed character. Returns `Some(true)` if correct, `Some(false)` if
     /// wrong, `None` if ignored (lenient mode ignores spaces and punctuation).
     pub fn type_char(&mut self, c: char) -> Option<bool> {
-        if self.done() {
+        if self.pos >= self.chars.len() {
+            // Done, or (must-fix mode) waiting for Backspace: extra keys don't count.
+            if self.needs_fixing() {
+                self.last_error = Some(Instant::now());
+            }
             return None;
         }
         if self.strictness == Strictness::Lenient && !c.is_alphanumeric() {
             return None;
         }
-        if self.matches(c, self.chars[self.pos]) {
-            self.pos += 1;
-            self.skip_unrequired();
-            Some(true)
-        } else {
+        let ok = self.matches(c, self.chars[self.pos]);
+        if !ok {
             self.last_error = Some(Instant::now());
-            Some(false)
+            if self.errors == ErrorMode::Block {
+                return Some(false);
+            }
         }
+        self.wrong[self.pos] = !ok;
+        self.pos += 1;
+        self.skip_unrequired();
+        Some(ok)
     }
 
     /// Step back one required character (progress and scroll follow).
@@ -216,13 +277,14 @@ impl Typing {
             p -= 1;
             if self.required[p] {
                 self.pos = p;
+                self.wrong[p] = false;
                 return;
             }
         }
     }
 
     pub fn done(&self) -> bool {
-        self.pos >= self.chars.len()
+        self.pos >= self.chars.len() && !self.needs_fixing()
     }
 
     fn required_before(&self, pos: usize) -> usize {
@@ -248,6 +310,9 @@ impl Typing {
 pub struct Stats {
     pub correct: u64,
     pub wrong: u64,
+    /// Wrong letters left in when a bubble ended ([`ErrorMode::Keep`]); each costs a word.
+    #[serde(default)]
+    pub uncorrected: u64,
     /// Active typing time in seconds.
     pub seconds: f64,
     #[serde(skip)]
@@ -269,9 +334,14 @@ impl Stats {
         if correct { self.correct += 1 } else { self.wrong += 1 }
     }
 
-    /// Words per minute: 5 correct characters = 1 word.
+    /// Net words per minute: 5 correct characters = 1 word, minus one word for every
+    /// wrong letter left in.
     pub fn wpm(&self) -> f64 {
-        if self.seconds < 1.0 { 0.0 } else { self.correct as f64 / 5.0 / (self.seconds / 60.0) }
+        if self.seconds < 1.0 {
+            0.0
+        } else {
+            ((self.correct as f64 / 5.0 - self.uncorrected as f64) / (self.seconds / 60.0)).max(0.0)
+        }
     }
 
     /// Correct keystrokes / all keystrokes, in percent.
@@ -284,6 +354,7 @@ impl Stats {
     pub fn merge(&mut self, other: &Stats) {
         self.correct += other.correct;
         self.wrong += other.wrong;
+        self.uncorrected += other.uncorrected;
         self.seconds += other.seconds;
     }
 }
@@ -352,7 +423,7 @@ mod tests {
     fn switching_mode_keeps_progress() {
         let mut t = Typing::new("HELLO THERE", Strictness::Strict, CaseMode::Sensitive);
         type_all(&mut t, "HELLO ");
-        let t2 = t.with_settings("HELLO THERE", Strictness::Strict, CaseMode::FirstLetter);
+        let t2 = t.with_settings("HELLO THERE", Strictness::Strict, CaseMode::FirstLetter, ErrorMode::Block);
         assert_eq!(t2.pos, 6);
         assert_eq!(t2.chars.iter().collect::<String>(), "Hello there");
     }
@@ -400,4 +471,42 @@ mod tests {
         assert!((s.accuracy() - 100.0 * 10.0 / 11.0).abs() < 1e-9);
         assert!((s.wpm() - 10.0 / 5.0 / (4.8 / 60.0)).abs() < 1e-6);
     }
+
+    #[test]
+    fn must_fix_mode() {
+        let mut t = Typing::new("AB", Strictness::Strict, CaseMode::Sensitive).errors(ErrorMode::Correct);
+        assert_eq!(type_all(&mut t, "AX"), [Some(true), Some(false)]);
+        assert!(t.is_wrong(1) && !t.done() && t.needs_fixing());
+        assert_eq!(t.type_char('B'), None, "no typing past the end");
+        t.backspace();
+        assert_eq!(t.type_char('B'), Some(true));
+        assert!(t.done() && t.uncorrected() == 0);
+    }
+
+    #[test]
+    fn keep_going_mode_counts_leftovers() {
+        let mut t = Typing::new("ABC", Strictness::Strict, CaseMode::Sensitive).errors(ErrorMode::Keep);
+        type_all(&mut t, "AXC");
+        assert!(t.done());
+        assert_eq!(t.uncorrected(), 1);
+        let mut s = Stats { correct: 50, uncorrected: 2, seconds: 60.0, ..Default::default() };
+        assert!((s.wpm() - 8.0).abs() < 1e-9, "10 words - 2");
+        s.uncorrected = 20;
+        assert_eq!(s.wpm(), 0.0);
+    }
+
+    #[test]
+    fn block_mode_is_unchanged() {
+        let mut t = Typing::new("AB", Strictness::Strict, CaseMode::Sensitive);
+        assert_eq!(t.type_char('X'), Some(false));
+        assert_eq!(t.pos, 0);
+        assert_eq!(t.uncorrected(), 0);
+    }
+
+    #[test]
+    fn old_stats_files_load() {
+        let s: Stats = serde_json::from_str(r#"{"correct":3,"wrong":1,"seconds":2.0}"#).unwrap();
+        assert_eq!(s.uncorrected, 0);
+    }
+
 }

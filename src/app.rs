@@ -10,9 +10,9 @@ use crate::library::{Library, LocalChapter, Mark};
 use crate::pages::Chapter;
 use crate::phone::{self, Series};
 use crate::reader::{self, Reader};
-use crate::settings::{Settings, SyncMode, default_library};
+use crate::settings::{ScrollMode, ScrollStep, Settings, SyncMode, default_library};
 use crate::sync::{Cmd, Ev, Worker};
-use crate::typing::{CaseMode, Strictness};
+use crate::typing::{CaseMode, ErrorMode, Strictness};
 
 const DIM: Color32 = Color32::from_gray(140);
 const GOOD: Color32 = Color32::from_rgb(120, 215, 140);
@@ -532,6 +532,33 @@ impl App {
                 ui.radio_value(&mut draft.strictness, Strictness::Strict, "Type spaces and punctuation");
                 ui.radio_value(&mut draft.strictness, Strictness::Lenient, "Letters and digits only");
             });
+            ui.horizontal(|ui| {
+                ui.label("Wrong letters:");
+                egui::ComboBox::from_id_salt("settings-errors").selected_text(draft.errors.label()).show_ui(ui, |ui| {
+                    for m in ErrorMode::ALL {
+                        ui.selectable_value(&mut draft.errors, m, m.label());
+                    }
+                });
+            });
+
+            ui.add_space(10.0);
+            ui.label(RichText::new("Scrolling").strong());
+            for m in ScrollMode::ALL {
+                ui.radio_value(&mut draft.scroll, m, m.label());
+            }
+            ui.add_enabled_ui(draft.scroll == ScrollMode::Manual, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Space scrolls:");
+                    for st in ScrollStep::ALL {
+                        ui.radio_value(&mut draft.space_step, st, st.label());
+                    }
+                });
+                ui.label(
+                    RichText::new("j / k / Space scroll while the bubble you're on is off screen; once it's in view they type. Arrows, Page Up/Down and the mouse wheel always scroll.")
+                        .color(DIM)
+                        .small(),
+                );
+            });
 
             ui.add_space(10.0);
             ui.label(RichText::new("Sync copies").strong());
@@ -595,11 +622,22 @@ impl eframe::App for App {
         if let Some(r) = &mut self.reader {
             let title = format!("manga-type — {}", phone::display_name(&r.chapter_path().file_name().unwrap_or_default().to_string_lossy()));
             set_title(&ctx, &mut self.title, title);
+            r.paused = self.settings_draft.is_some();
             let action = r.show(ui);
-            if r.settings != self.settings {
+            if r.settings != self.settings && self.settings_draft.is_none() {
                 self.settings = r.settings.clone();
             }
+            self.settings_dialog(&ctx);
+            if let Some(r) = &mut self.reader
+                && r.settings != self.settings
+                && self.settings_draft.is_none()
+            {
+                r.apply_settings(self.settings.clone());
+            }
             match action {
+                Some(reader::Action::Settings) => {
+                    self.settings_draft = Some((self.settings.clone(), self.settings.library.display().to_string()));
+                }
                 Some(reader::Action::Back) => {
                     self.reader = None; // saves on drop
                     self.reload();

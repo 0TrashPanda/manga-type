@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::typing::{CaseMode, Strictness};
+use crate::typing::{CaseMode, ErrorMode, Strictness};
 
 /// What "Sync" copies from the phone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -31,11 +31,65 @@ impl SyncMode {
     }
 }
 
+/// How the reading strip moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ScrollMode {
+    /// You scroll yourself (arrows, j/k, Space, mouse wheel); typing never moves the page.
+    #[default]
+    Manual,
+    /// Typing a bubble scrolls the page toward it (the original design).
+    FollowTyping,
+}
+
+impl ScrollMode {
+    pub const ALL: [ScrollMode; 2] = [ScrollMode::Manual, ScrollMode::FollowTyping];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScrollMode::Manual => "Manual: arrows, j / k, Space, mouse wheel",
+            ScrollMode::FollowTyping => "Follow typing: the page moves as you type",
+        }
+    }
+}
+
+/// How far Space scrolls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ScrollStep {
+    Page,
+    #[default]
+    Half,
+    Quarter,
+}
+
+impl ScrollStep {
+    pub const ALL: [ScrollStep; 3] = [ScrollStep::Page, ScrollStep::Half, ScrollStep::Quarter];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScrollStep::Page => "One page",
+            ScrollStep::Half => "Half a page",
+            ScrollStep::Quarter => "A quarter page",
+        }
+    }
+
+    /// Fraction of the window height. A full page keeps a little overlap for context.
+    pub fn fraction(self) -> f32 {
+        match self {
+            ScrollStep::Page => 0.9,
+            ScrollStep::Half => 0.5,
+            ScrollStep::Quarter => 0.25,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub strictness: Strictness,
     pub case: CaseMode,
+    pub errors: ErrorMode,
+    pub scroll: ScrollMode,
+    pub space_step: ScrollStep,
     /// Where copied chapters live: `<library>/<Source>/<Series>/<chapter>.cbz`.
     pub library: PathBuf,
     pub sync_mode: SyncMode,
@@ -48,6 +102,9 @@ impl Default for Settings {
         Self {
             strictness: Strictness::default(),
             case: CaseMode::default(),
+            errors: ErrorMode::default(),
+            scroll: ScrollMode::default(),
+            space_step: ScrollStep::default(),
             library: default_library(),
             sync_mode: SyncMode::default(),
             workers: 0,

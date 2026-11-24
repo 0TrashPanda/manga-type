@@ -383,6 +383,14 @@ fn fix_question_marks(text: &str, dict: &Dictionary, changed: &mut usize) -> Str
     toks.iter()
         .enumerate()
         .map(|(i, tok)| {
+            // "LIFE...7": a 7 right after an ellipsis is a ?.
+            if let Some(head) = tok.strip_suffix('7')
+                && head.ends_with("...")
+                && head.chars().any(char::is_alphabetic)
+            {
+                *changed += 1;
+                return format!("{head}?");
+            }
             // Strip a Z/2 that sits where a ? belongs: at the end, or after ?/!.
             let core = tok.trim_end_matches(['?', '!', '.', ',']);
             let tail = &tok[core.len()..];
@@ -502,6 +510,15 @@ mod tests {
         assert_eq!(trim_stray_marks("... HUH?"), "... HUH?");
         assert_eq!(trim_stray_marks("WAIT, - NO"), "WAIT, - NO", "only the edges");
         assert_eq!(trim_stray_marks("."), ".", "never empties a bubble");
+    }
+
+
+    #[test]
+    fn seven_after_ellipsis_is_a_question_mark() {
+        let mut n = 0;
+        assert_eq!(fix_question_marks("YOUR PAST LIFE...7", &dict(), &mut n), "YOUR PAST LIFE...?");
+        assert_eq!(fix_question_marks("CHAPTER 7", &dict(), &mut n), "CHAPTER 7");
+        assert_eq!(fix_question_marks("...7", &dict(), &mut n), "...7");
     }
 
 }
