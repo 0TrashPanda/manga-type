@@ -203,6 +203,11 @@ impl Typing {
         self
     }
 
+    /// Whether `c` is the right next key.
+    pub fn expects(&self, c: char) -> bool {
+        self.chars.get(self.pos).is_some_and(|&want| self.matches(c, want))
+    }
+
     /// Whether the character at `i` was typed wrong and not fixed.
     pub fn is_wrong(&self, i: usize) -> bool {
         self.wrong.get(i).copied().unwrap_or(false)

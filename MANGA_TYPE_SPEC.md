@@ -81,7 +81,8 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
 
 ## Reading / scroll mechanics
 - Scrolling setting (2026-11-24, user's choice), **default: manual**. Typing never moves the page.
-  - Arrows, Page Up/Down, mouse wheel always scroll. j / k / Space (step: page, half, quarter; setting) and Shift+Space scroll only while the current bubble is off screen; once it's on screen those keys type. Typing is blocked while the bubble is off screen (its text is dimmed with a hint).
+  - Arrows, Page Up/Down, mouse wheel always scroll. j / k / Space (step: page, half, quarter; setting) and Shift+Space keep scrolling until you type the first letter of the current bubble (with the bubble on screen); from then until the bubble is done they type. If the bubble really starts with j or k, that key starts typing. Typing is blocked while the bubble is off screen (its text is dimmed with a hint).
+- Zoom: Ctrl + / Ctrl - / Ctrl 0 (reset) and Ctrl + mouse wheel zoom the page (30-400%, saved as `zoom`), keeping the middle of the view in place. Left / Right pan when zoomed wider than the window. egui's own interface zoom is turned off.
   - "Follow typing" keeps the original mechanics below, plus: a bubble is first brought on screen (bottom at 85% of the view) before typing it.
 - Pages stacked vertically in one scroll area, user input scrolling disabled. Only typing moves it.
 - Per bubble: start scroll position = where the previous bubble left off. End position = bubble center at about 38% of viewport height. Scroll target = lerp(start, end, typedChars / totalChars). Ease toward the target each frame (about 0.14 per frame).

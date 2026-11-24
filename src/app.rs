@@ -734,6 +734,8 @@ pub fn run(open: Option<PathBuf>) -> Result<(), String> {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            // Ctrl +/- zooms the manga page in the reader, not the whole interface.
+            cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
             Ok(Box::new(App::new(&cc.egui_ctx, open)))
         }),
     )

@@ -90,6 +90,8 @@ pub struct Settings {
     pub errors: ErrorMode,
     pub scroll: ScrollMode,
     pub space_step: ScrollStep,
+    /// Page zoom in the reader (Ctrl +/-/0): 1.0 = fit the window (max 1000 pt wide).
+    pub zoom: f32,
     /// Where copied chapters live: `<library>/<Source>/<Series>/<chapter>.cbz`.
     pub library: PathBuf,
     pub sync_mode: SyncMode,
@@ -105,6 +107,7 @@ impl Default for Settings {
             errors: ErrorMode::default(),
             scroll: ScrollMode::default(),
             space_step: ScrollStep::default(),
+            zoom: 1.0,
             library: default_library(),
             sync_mode: SyncMode::default(),
             workers: 0,

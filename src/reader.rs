@@ -36,6 +36,10 @@ const FOCUS: f32 = 0.38;
 /// A new bubble is first brought at least this far up (its bottom edge, as a fraction of
 /// viewport height), so you never type text that's still off screen.
 const REVEAL: f32 = 0.85;
+/// Page zoom limits and the step per Ctrl +/- press.
+const ZOOM_MIN: f32 = 0.3;
+const ZOOM_MAX: f32 = 4.0;
+const ZOOM_STEP: f32 = 1.15;
 /// j / k / arrow keys scroll this fraction of the window height.
 const LINE_STEP: f32 = 0.12;
 /// Padding around a bubble's text box when drawing its highlight (strip px).
@@ -113,8 +117,12 @@ pub struct Reader {
     scroll: f32,
     /// Where manual scrolling (keys, wheel) is heading; the view eases toward it.
     manual_target: f32,
-    /// Screen points per strip pixel (from the last frame).
+    /// You've typed the first letter of the current bubble: from now on j / k / Space type.
+    typing_started: bool,
+    /// Screen points per strip pixel (from the last frame; 0 before the first).
     scale: f32,
+    /// Sideways offset of the page in screen points, when zoomed wider than the window.
+    pan_x: f32,
     /// Where the current bubble started from (the previous bubble's end).
     start_scroll: f32,
     /// Viewport height in strip pixels (from the last frame).
@@ -199,7 +207,9 @@ impl Reader {
             restore_pending: false,
             scroll: 0.0,
             manual_target: 0.0,
-            scale: 1.0,
+            typing_started: false,
+            scale: 0.0,
+            pan_x: 0.0,
             start_scroll: 0.0,
             view_h: 1000.0,
             tiles: HashMap::new(),
@@ -393,6 +403,7 @@ impl Reader {
         self.chapter_stats.merge(&self.bubble_stats);
         self.bubble_stats = Stats::default();
         self.current += 1;
+        self.typing_started = false;
         self.typing = self.bubbles.get(self.current).map(|b| self.new_typing(b.target()));
         self.save_progress();
     }
@@ -459,9 +470,65 @@ impl Reader {
         })
     }
 
-    /// Scrolling keys (manual mode). j / k / Space only scroll while the bubble you're on
-    /// is off screen; once it's in view they type. Returns whether a Text event for a
-    /// Shift+Space should be swallowed.
+    /// Ctrl + / Ctrl - / Ctrl 0 and Ctrl + mouse wheel zoom the page; Left / Right pan
+    /// when it's wider than the window. Saved as a setting.
+    fn handle_zoom_keys(&mut self, ctx: &egui::Context) {
+        use egui::KeyboardShortcut as K;
+        let before = self.settings.zoom;
+        let mut zoom = before;
+        ctx.input_mut(|i| {
+            if i.consume_shortcut(&K::new(Modifiers::COMMAND, Key::Num0)) {
+                zoom = 1.0;
+            }
+            if i.consume_shortcut(&K::new(Modifiers::COMMAND, Key::Plus))
+                || i.consume_shortcut(&K::new(Modifiers::COMMAND, Key::Equals))
+            {
+                zoom *= ZOOM_STEP;
+            }
+            if i.consume_shortcut(&K::new(Modifiers::COMMAND, Key::Minus)) {
+                zoom /= ZOOM_STEP;
+            }
+            // Ctrl + wheel (and touchpad pinch).
+            zoom *= i.zoom_delta();
+            if i.key_pressed(Key::ArrowLeft) {
+                self.pan_x += 80.0;
+            }
+            if i.key_pressed(Key::ArrowRight) {
+                self.pan_x -= 80.0;
+            }
+        });
+        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if (zoom - before).abs() > 1e-4 {
+            self.settings.zoom = zoom;
+            if (zoom - 1.0).abs() < 0.02 {
+                self.settings.zoom = 1.0;
+            }
+            if let Err(e) = self.settings.save() {
+                self.notice = Some(format!("Couldn't save settings: {e}"));
+            }
+        }
+    }
+
+    /// Scroll for a j / k / Space typed as text (manual mode).
+    fn scroll_char(&mut self, c: char) {
+        match c {
+            'j' => self.scroll_by(LINE_STEP * self.view_h),
+            'k' => self.scroll_by(-LINE_STEP * self.view_h),
+            ' ' => self.scroll_by(self.settings.space_step.fraction() * self.view_h),
+            _ => {}
+        }
+    }
+
+    /// Whether j / k / Space type (true) or scroll (false). In manual mode they scroll
+    /// until you've typed the first letter of the bubble you're on (it must be on screen),
+    /// and again from the next bubble on.
+    fn keys_type(&self) -> bool {
+        self.settings.scroll != ScrollMode::Manual
+            || (self.typing_started && !self.at_end() && self.current_placement() == Some(std::cmp::Ordering::Equal))
+    }
+
+    /// Scrolling that works in every state (manual mode): wheel, arrows, Page Up/Down,
+    /// Shift+Space, and at the end of the chapter also j / k / Space.
     fn handle_scroll_keys(&mut self, ctx: &egui::Context) {
         if self.settings.scroll != ScrollMode::Manual {
             return;
@@ -473,7 +540,9 @@ impl Reader {
         if wheel != 0.0 {
             self.scroll_by(-wheel / self.scale.max(0.01));
         }
-        let typing_here = !self.at_end() && self.current_placement() == Some(std::cmp::Ordering::Equal);
+        let keys_type = self.keys_type();
+        let at_end = self.at_end();
+        let shift = ctx.input(|i| i.modifiers.shift);
         let events = ctx.input(|i| i.events.clone());
         for ev in &events {
             match ev {
@@ -482,21 +551,13 @@ impl Reader {
                     Key::ArrowUp => self.scroll_by(-line),
                     Key::PageDown => self.scroll_by(page),
                     Key::PageUp => self.scroll_by(-page),
-                    Key::Home if !typing_here => self.manual_target = 0.0,
-                    Key::End if !typing_here => self.manual_target = self.max_scroll(),
+                    Key::Home if !keys_type => self.manual_target = 0.0,
+                    Key::End if !keys_type => self.manual_target = self.max_scroll(),
                     Key::Space if modifiers.shift => self.scroll_by(-space),
                     _ => {}
                 },
-                egui::Event::Text(t) if !typing_here => {
-                    for c in t.chars() {
-                        match c {
-                            'j' => self.scroll_by(line),
-                            'k' => self.scroll_by(-line),
-                            ' ' if !ctx.input(|i| i.modifiers.shift) => self.scroll_by(space),
-                            _ => {}
-                        }
-                    }
-                }
+                // Typing is over: the keys only scroll (handle_keys isn't called).
+                egui::Event::Text(t) if at_end && !(shift && t == " ") => t.chars().for_each(|c| self.scroll_char(c)),
                 _ => {}
             }
         }
@@ -508,16 +569,27 @@ impl Reader {
             self.advance(State::Skipped);
             return;
         }
-        // Manual scrolling: the bubble must be on screen before you type it.
-        if self.current_placement().is_some_and(|p| p != std::cmp::Ordering::Equal) {
-            return;
-        }
+        let manual = self.settings.scroll == ScrollMode::Manual;
         let shift = ctx.input(|i| i.modifiers.shift);
+        let on_screen = self.current_placement().is_none_or(|p| p == std::cmp::Ordering::Equal);
         for ev in events {
             match ev {
-                // Shift+Space scrolls up in manual mode; don't also type a space.
-                egui::Event::Text(text) if !(shift && text == " " && self.settings.scroll == ScrollMode::Manual) => {
+                // Shift+Space scrolls up in manual mode (handle_scroll_keys); don't type it.
+                egui::Event::Text(text) if !(manual && shift && text == " ") => {
                     for c in text.chars() {
+                        let scroll_key = matches!(c, 'j' | 'k' | ' ');
+                        if manual && !self.typing_started {
+                            // Before the first letter: j / k / Space scroll, unless the bubble
+                            // really starts with that letter. Off screen nothing types.
+                            let expected = self.typing.as_ref().is_some_and(|t| t.expects(c));
+                            if !on_screen || (scroll_key && !expected) {
+                                if scroll_key {
+                                    self.scroll_char(c);
+                                }
+                                continue;
+                            }
+                            self.typing_started = true;
+                        }
                         if let Some(t) = &mut self.typing
                             && let Some(ok) = t.type_char(c)
                         {
@@ -525,7 +597,7 @@ impl Reader {
                         }
                     }
                 }
-                egui::Event::Key { key: Key::Backspace, pressed: true, .. } => {
+                egui::Event::Key { key: Key::Backspace, pressed: true, .. } if on_screen => {
                     if let Some(t) = &mut self.typing {
                         t.backspace();
                     }
@@ -566,6 +638,7 @@ impl Reader {
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         self.edits.insert(rect_key(b), text.clone());
         self.typing = Some(self.new_typing(&text));
+        self.typing_started = false;
         self.refresh();
         self.save_cache();
     }
@@ -577,11 +650,24 @@ impl Reader {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::from_gray(18));
 
-        let width = (rect.width() - 24.0).clamp(100.0, MAX_WIDTH);
+        let fit = (rect.width() - 24.0).clamp(100.0, MAX_WIDTH);
+        let width = (fit * self.settings.zoom).max(60.0);
         let scale = width / self.ch.strip_width as f32;
+        let view_h = rect.height() / scale;
+        // Zoom (or a window resize) changed the scale: keep the middle of the view in place.
+        if self.scale > 0.0 && (scale - self.scale).abs() > 1e-6 {
+            let keep = |y: f32| y + (self.view_h - view_h) / 2.0;
+            self.scroll = keep(self.scroll);
+            self.manual_target = keep(self.manual_target);
+        }
         self.scale = scale;
-        self.view_h = rect.height() / scale;
-        let x0 = rect.center().x - width / 2.0;
+        self.view_h = view_h;
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        self.manual_target = self.manual_target.clamp(0.0, self.max_scroll());
+        // Wider than the window: Left / Right pan; otherwise centred.
+        let max_pan = ((width - rect.width()) / 2.0 + 12.0).max(0.0);
+        self.pan_x = self.pan_x.clamp(-max_pan, max_pan);
+        let x0 = rect.center().x - width / 2.0 + self.pan_x;
         let to_screen = |x: f32, y: f32| Pos2::new(x0 + x * scale, rect.top() + (y - self.scroll) * scale);
 
         // Load pages around the view, drop far ones.
@@ -701,6 +787,11 @@ impl Reader {
                     Some(std::cmp::Ordering::Less) => {
                         ui.label(egui::RichText::new("▲ scroll up to this bubble (k, Shift+Space, ↑, wheel)").color(ACCENT));
                     }
+                    Some(_) if self.settings.scroll == ScrollMode::Manual && !self.typing_started => {
+                        ui.label(
+                            egui::RichText::new("Type the first letter to start · until then j / k / Space scroll").color(DIM_TEXT),
+                        );
+                    }
                     _ => {}
                 }
                 if self.typing.as_ref().is_some_and(Typing::needs_fixing) {
@@ -741,12 +832,17 @@ impl Reader {
         }
 
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        // Wraps onto a second line in narrow windows instead of cutting buttons off.
+        ui.horizontal_wrapped(|ui| {
             if ui.button("← Library").on_hover_text("Back to the library (Esc). Your place is saved.").clicked() {
                 action = Some(Action::Back);
             }
             if ui.button("Settings").clicked() {
                 action = Some(Action::Settings);
+            }
+            if (self.settings.zoom - 1.0).abs() > 1e-3 {
+                ui.label(egui::RichText::new(format!("zoom {:.0}%", self.settings.zoom * 100.0)).color(DIM_TEXT))
+                    .on_hover_text("Ctrl + / Ctrl - / Ctrl 0 (reset), or Ctrl + mouse wheel");
             }
             ui.separator();
             let total = self.total_stats();
@@ -828,6 +924,7 @@ impl Reader {
         let mut action = None;
 
         if self.editing.is_none() && !self.paused {
+            self.handle_zoom_keys(&ctx);
             // Keys go to typing, not to whatever button was clicked last (Space would press it).
             ctx.memory_mut(|m| {
                 if let Some(id) = m.focused() {
@@ -854,7 +951,7 @@ impl Reader {
             self.save_progress();
         }
 
-        if let Some(a) = egui::Panel::bottom("bar").exact_size(124.0).show(ui, |ui| self.draw_bar(ui)).inner {
+        if let Some(a) = egui::Panel::bottom("bar").exact_size(150.0).show(ui, |ui| self.draw_bar(ui)).inner {
             action = Some(a);
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.draw_strip(ui));
