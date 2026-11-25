@@ -59,14 +59,37 @@ YOU'LL YOU'RE YOU'VE YOUR";
 pub struct Dictionary {
     words: HashSet<String>,
     common: HashSet<&'static str>,
+    /// Words the list only has capitalized ("Cando", "Andis"): names, so a glued
+    /// "CANDO" is more likely CAN DO.
+    names: HashSet<String>,
 }
 
 impl Dictionary {
     pub fn from_words(words: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            words: words.into_iter().map(|w| normalize(&w)).collect(),
-            common: COMMON.split_whitespace().collect(),
+        let mut all = HashSet::new();
+        let mut capitalized = HashSet::new();
+        let mut lower = HashSet::new();
+        for w in words {
+            let n = normalize(&w);
+            let mut cs = w.chars();
+            if cs.next().is_some_and(char::is_uppercase) && cs.any(char::is_lowercase) {
+                capitalized.insert(n.clone());
+            } else if w.chars().any(char::is_lowercase) {
+                lower.insert(n.clone());
+            }
+            all.insert(n);
         }
+        Self {
+            words: all,
+            common: COMMON.split_whitespace().collect(),
+            names: capitalized.difference(&lower).cloned().collect(),
+        }
+    }
+
+    /// Only known as a name (see `names`), and not a common word.
+    fn is_name_only(&self, w: &str) -> bool {
+        let n = normalize(w);
+        self.names.contains(&n) && !self.common.contains(n.as_str())
     }
 
     /// Load the cached word list, building it from the installed Tesseract data the first
@@ -305,7 +328,182 @@ fn fix_text(text: &str, dict: &Dictionary, active: &[usize], changed: &mut usize
     out = fix_lone_i(&out, n_alpha, changed);
     // `?` read as `Z`/`2` glued to a word: "THATZ" -> "THAT?", "PROBLEM?Z" -> "PROBLEM?".
     out = fix_question_marks(&out, dict, changed);
+    out = fix_tokens(&out, dict, changed);
     trim_stray_marks(&out)
+}
+
+/// `(leading marks, core, trailing marks)` of a space-separated token. The core keeps
+/// letters, digits, apostrophes and `#` (Tesseract's H in some fonts).
+fn token_parts(t: &str) -> (&str, &str, &str) {
+    let keep = |c: char| c.is_alphanumeric() || c == '#';
+    let Some(start) = t.find(keep) else { return (t, "", "") };
+    let end = t.rfind(keep).map_or(t.len(), |i| i + t[i..].chars().next().map_or(1, char::len_utf8));
+    (&t[..start], &t[start..end], &t[end..])
+}
+
+/// One letter removed from a tripled letter, or a doubled one at the start or end of the
+/// word, when that makes a word: "I'LLL" -> "I'LL", "YYOU" -> "YOU", "MYY" -> "MY".
+/// Doubles inside a word are left alone: real words missing from the list ("COOPED").
+fn undouble(core: &str, dict: &Dictionary) -> Option<String> {
+    // Runs of 3+ become 2 first ("I'LLL" -> "I'LL"); a long run is never a word anyway
+    // ("AAAAAAAH" is a sound effect: no blow-up trying every removal).
+    let mut chars: Vec<char> = Vec::with_capacity(core.len());
+    for c in core.chars() {
+        let n = chars.len();
+        if n >= 2 && chars[n - 1] == c && chars[n - 2] == c {
+            continue;
+        }
+        chars.push(c);
+    }
+    let collapsed: String = chars.iter().collect();
+    if collapsed != core && dict.contains(&collapsed) {
+        return Some(collapsed);
+    }
+    // Then one letter off one doubled pair: at the start or end of the word, or inside
+    // it when that gives a very common word ("JUUST").
+    let n = chars.len();
+    for i in 1..n {
+        if chars[i] != chars[i - 1] || !chars[i].is_alphabetic() {
+            continue;
+        }
+        let cand: String = chars[..i].iter().chain(&chars[i + 1..]).collect();
+        let at_edge = i == 1 || i == n - 1;
+        if (at_edge || dict.is_common(&cand)) && dict.contains(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Two words glued together ("HOWPATHETIC", "CANDO", "TOSHINE"): split where both halves
+/// are words and at least one is common. Prefers the split with the longest shorter half.
+fn split_glued(core: &str, dict: &Dictionary) -> Option<(String, String)> {
+    let chars: Vec<char> = core.chars().collect();
+    if chars.len() < 4 || !chars.iter().all(|c| c.is_alphabetic()) {
+        return None;
+    }
+    (1..chars.len())
+        .filter_map(|i| {
+            let (a, b): (String, String) = (chars[..i].iter().collect(), chars[i..].iter().collect());
+            let short_ok = |w: &str| w.chars().count() >= 2 || matches!(w, "A" | "I" | "a");
+            (short_ok(&a)
+                && short_ok(&b)
+                && dict.contains(&a)
+                && dict.contains(&b)
+                && (dict.is_common(&a) || dict.is_common(&b)))
+            .then(|| (a.chars().count().min(b.chars().count()), a, b))
+        })
+        .max_by_key(|(k, _, _)| *k)
+        .map(|(_, a, b)| (a, b))
+}
+
+/// Token-level fixes with the dictionary, after the per-word ones:
+/// - `#` read for H ("T#OUG#T" -> "THOUGHT"), doubled letters ("YYOU"), glued words;
+/// - "70" / "50" between words are TO / SO ("WANT 70 DIE");
+/// - a word split in two by a lost hyphen ("EY ESIGHT" -> "EYESIGHT");
+/// - lone letters other than A / I / O, and lone digits at the ends, are outline specks.
+fn fix_tokens(text: &str, dict: &Dictionary, changed: &mut usize) -> String {
+    let mut toks: Vec<String> = text.split(' ').filter(|t| !t.is_empty()).map(String::from).collect();
+    let alpha = |t: &str| {
+        let (_, c, _) = token_parts(t);
+        !c.is_empty() && c.chars().all(|ch| ch.is_alphabetic() || ch == '\'' || ch == '’')
+    };
+
+    // Per token.
+    let mut out: Vec<String> = Vec::with_capacity(toks.len());
+    for i in 0..toks.len() {
+        let (lead, core, trail) = token_parts(&toks[i]);
+        let (lead, core, trail) = (lead.to_string(), core.to_string(), trail.to_string());
+        let mut fixed: Option<String> = None;
+        if core.contains('#') {
+            let cand = core.replace('#', "H");
+            if dict.contains(&cand) {
+                fixed = Some(cand);
+            }
+        } else if (core == "70" || core == "50")
+            && i > 0
+            && i + 1 < toks.len()
+            && alpha(&toks[i - 1])
+            && alpha(&toks[i + 1])
+            && !toks[i - 1].ends_with(['.', '!', '?'])
+        {
+            fixed = Some(if core == "70" { "TO" } else { "SO" }.to_string());
+        } else if !core.is_empty() && !dict.contains(&core) && core.chars().any(char::is_alphabetic) {
+            if let Some(c) = undouble(&core, dict) {
+                fixed = Some(c);
+            } else if let Some((a, b)) = split_glued(&core, dict) {
+                fixed = Some(format!("{a} {b}"));
+            }
+        } else if dict.is_name_only(&core)
+            && let Some((a, b)) = split_glued(&core, dict)
+            && dict.is_common(&a)
+            && dict.is_common(&b)
+        {
+            // "CANDO" / "ANDIS" are names in the list, but in a bubble they're CAN DO / AND IS.
+            fixed = Some(format!("{a} {b}"));
+        }
+        match fixed {
+            Some(f) => {
+                *changed += 1;
+                out.push(format!("{lead}{}{trail}", super::fix::match_case(&core, &f)));
+            }
+            None => out.push(toks[i].clone()),
+        }
+    }
+    toks = out;
+
+    // Join halves of a word: neither half is a word, together they are.
+    let mut joined: Vec<String> = Vec::with_capacity(toks.len());
+    for t in toks {
+        if let Some(prev) = joined.last() {
+            let (pl, pc, pt) = token_parts(prev);
+            let (tl, tc, _) = token_parts(&t);
+            let cand = format!("{pc}{tc}");
+            if pt.is_empty()
+                && tl.is_empty()
+                && pc.chars().count() >= 2
+                && tc.chars().count() >= 2
+                && pc.chars().all(char::is_alphabetic)
+                && tc.chars().all(char::is_alphabetic)
+                && !dict.contains(pc)
+                && !dict.contains(tc)
+                && dict.contains(&cand)
+            {
+                *changed += 1;
+                let merged = format!("{pl}{cand}{}", &t[tl.len() + tc.len()..]);
+                *joined.last_mut().unwrap() = merged;
+                continue;
+            }
+        }
+        joined.push(t);
+    }
+
+    // Lone specks: single letters other than A / I / O anywhere, single digits at the ends.
+    let words = joined.iter().filter(|t| token_parts(t).1.chars().filter(|c| c.is_alphabetic()).count() >= 2).count();
+    if words >= 2 {
+        let n = joined.len();
+        let kept: Vec<String> = joined
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| {
+                let speck = |t: &str| {
+                    t.chars().count() == 1
+                        && t.chars().all(|c| c.is_alphabetic() && !matches!(c.to_ascii_uppercase(), 'A' | 'I' | 'O'))
+                };
+                let digit = t.chars().count() == 1 && t.chars().all(|c| c.is_ascii_digit());
+                // A digit at the end is a speck; at the start only before another speck
+                // ("4 P HYUNG!"), since "5 GOLD?" is real.
+                let end_digit = digit && (*i + 1 == n || (*i == 0 && joined.get(1).is_some_and(|n| speck(n))));
+                !(speck(t) || end_digit)
+            })
+            .map(|(_, t)| t.clone())
+            .collect();
+        if kept.len() != joined.len() {
+            *changed += 1;
+            joined = kept;
+        }
+    }
+    joined.join(" ")
 }
 
 /// Drop a lone mark token at the start or end of a bubble (". AND IS...", "RUMORS? )"):
@@ -519,6 +717,52 @@ mod tests {
         assert_eq!(fix_question_marks("YOUR PAST LIFE...7", &dict(), &mut n), "YOUR PAST LIFE...?");
         assert_eq!(fix_question_marks("CHAPTER 7", &dict(), &mut n), "CHAPTER 7");
         assert_eq!(fix_question_marks("...7", &dict(), &mut n), "...7");
+    }
+
+
+    #[test]
+    fn token_fixes() {
+        let words = "HOW PATHETIC CAN DO IT TO DIE WANT SHINE THOUGHT I'LL HELP YOU EYESIGHT VERY BAD \
+                     SO TIRED I'M THE ABLE SURVIVE IF YOU SAID GOING FIGHT WHAT SHOULD WE NOW ON HAVE";
+        let d = Dictionary::from_words(words.split_whitespace().map(String::from));
+        let f = |t: &str| fix_tokens(t, &d, &mut 0);
+        assert_eq!(f("HOWPATHETIC FOR"), "HOW PATHETIC FOR");
+        assert_eq!(f("YOU CANDO IT"), "YOU CAN DO IT");
+        assert_eq!(f("I T#OUG#T YOU SAID"), "I THOUGHT YOU SAID");
+        assert_eq!(f("I'LLL HELP YOU."), "I'LL HELP YOU.");
+        assert_eq!(f("YYOU!! DIE!"), "YOU!! DIE!");
+        assert_eq!(f("DO YOU WANT 70 DIE?!"), "DO YOU WANT TO DIE?!");
+        assert_eq!(f("I'M 50 TIRED"), "I'M SO TIRED");
+        assert_eq!(f("YOU WANT 70."), "YOU WANT 70.", "no word after: a number");
+        assert_eq!(f("VERY BAD EY ESIGHT"), "VERY BAD EYESIGHT");
+        assert_eq!(f("4 N W-WHAT SHOULD WE DO FROM NOW ON? Y"), "W-WHAT SHOULD WE DO FROM NOW ON?");
+        assert_eq!(f("GOING L 70 FIGHT?!"), "GOING TO FIGHT?!");
+        assert_eq!(f("A HAVE"), "A HAVE", "A / I / O stay");
+        assert_eq!(f("LV. 3"), "LV. 3", "too few words to judge");
+        assert_eq!(f("YOU SHOULD STAY COOPED UP"), "YOU SHOULD STAY COOPED UP", "inner doubles stay");
+        assert_eq!(f("WHAT DID YOU JUUST SAY"), "WHAT DID YOU JUST SAY", "unless it gives a common word");
+        assert_eq!(f("5 GOLD? THAT STUPID"), "5 GOLD? THAT STUPID");
+        assert_eq!(f("4 P HYUNG! WHAT SHOULD"), "HYUNG! WHAT SHOULD");
+    }
+
+
+    #[test]
+    fn glued_common_words_beat_names() {
+        let d = Dictionary::from_words(["Cando", "Andis", "can", "do", "and", "is", "it", "you", "instead"].map(String::from));
+        let f = |t: &str| fix_tokens(t, &d, &mut 0);
+        assert_eq!(f("YOU CANDO IT"), "YOU CAN DO IT");
+        assert_eq!(f("ANDIS INSTEAD"), "AND IS INSTEAD");
+    }
+
+
+    #[test]
+    fn long_letter_runs_are_fast() {
+        let d = dict();
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        let _ = fix_tokens("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH! WHAT", &d, &mut n);
+        let _ = fix_tokens("WAAAAAAAAAHHHHHHHHHHHHHHHHHHHHHHHH!! HUH", &d, &mut n);
+        assert!(t.elapsed().as_millis() < 100);
     }
 
 }

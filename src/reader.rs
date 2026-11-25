@@ -443,9 +443,19 @@ impl Reader {
         self.raw_done.is_some() && self.dict_rx.is_none() && self.current >= self.bubbles.len()
     }
 
+    /// Furthest manual scrolling may go: the bubble you're on sticks to the top of the
+    /// screen until it's typed or skipped (Tab).
+    fn scroll_limit(&self) -> f32 {
+        let max = self.max_scroll();
+        match self.bubbles.get(self.current) {
+            Some(b) if self.settings.scroll == ScrollMode::Manual => (b.rect.y0 - PAD - 8.0).clamp(0.0, max),
+            _ => max,
+        }
+    }
+
     /// Scroll by `amount` strip pixels (manual mode).
     fn scroll_by(&mut self, amount: f32) {
-        self.manual_target = (self.manual_target + amount).clamp(0.0, self.max_scroll());
+        self.manual_target = (self.manual_target + amount).clamp(0.0, self.scroll_limit());
     }
 
     /// Where the current bubble is relative to the (target) view: `Ordering::Equal` when
@@ -552,7 +562,7 @@ impl Reader {
                     Key::PageDown => self.scroll_by(page),
                     Key::PageUp => self.scroll_by(-page),
                     Key::Home if !keys_type => self.manual_target = 0.0,
-                    Key::End if !keys_type => self.manual_target = self.max_scroll(),
+                    Key::End if !keys_type => self.manual_target = self.scroll_limit(),
                     Key::Space if modifiers.shift => self.scroll_by(-space),
                     _ => {}
                 },
@@ -663,7 +673,7 @@ impl Reader {
         self.scale = scale;
         self.view_h = view_h;
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
-        self.manual_target = self.manual_target.clamp(0.0, self.max_scroll());
+        self.manual_target = self.manual_target.clamp(0.0, self.scroll_limit());
         // Wider than the window: Left / Right pan; otherwise centred.
         let max_pan = ((width - rect.width()) / 2.0 + 12.0).max(0.0);
         self.pan_x = self.pan_x.clamp(-max_pan, max_pan);

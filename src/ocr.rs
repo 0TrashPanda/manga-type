@@ -25,7 +25,8 @@ pub const BAND_OVERLAP: f32 = 400.0;
 const MIN_WORD_CONF: f32 = 45.0;
 /// Bump when the merge/filter rules change, so old caches get re-scanned.
 // 10: second, thresholded OCR pass on dark bands (glowing light-on-dark lettering).
-const CACHE_VERSION: u32 = 10;
+// 11: every bubble re-read on its own as a text block (psm 6), better reading kept.
+const CACHE_VERSION: u32 = 11;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -79,6 +80,8 @@ pub struct Line {
     pub rect: Rect,
     pub text: String,
     pub conf: f32,
+    /// The words with their boxes (left to right); `text` is them joined by spaces.
+    pub words: Vec<(Rect, String)>,
 }
 
 /// A speech bubble: merged lines.
@@ -107,7 +110,12 @@ impl Bubble {
 
 /// An OCR backend. Tesseract today; `ocrs` could be dropped in later.
 pub trait OcrEngine: Send + Sync {
+    /// Find text anywhere in a band (sparse text).
     fn lines(&self, img: &GrayImage) -> Result<Vec<Line>, String>;
+    /// Read a crop around one bubble as a single block of text.
+    fn block(&self, img: &GrayImage) -> Result<Vec<Line>, String> {
+        self.lines(img)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,12 +151,23 @@ impl Tesseract {
 
 impl OcrEngine for Tesseract {
     fn lines(&self, img: &GrayImage) -> Result<Vec<Line>, String> {
+        self.run(img, "11")
+    }
+
+    fn block(&self, img: &GrayImage) -> Result<Vec<Line>, String> {
+        self.run(img, "6")
+    }
+}
+
+impl Tesseract {
+    /// Run tesseract with a page segmentation mode: 11 = sparse text, 6 = one text block.
+    fn run(&self, img: &GrayImage, psm: &str) -> Result<Vec<Line>, String> {
         let mut png = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .map_err(|e| e.to_string())?;
 
         let mut child = Command::new(&self.binary)
-            .args(["-", "-", "--psm", "11", "-l", "eng", "tsv"])
+            .args(["-", "-", "--psm", psm, "-l", "eng", "tsv"])
             .env("OMP_THREAD_LIMIT", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -196,7 +215,8 @@ fn parse_tsv(tsv: &str) -> Vec<Line> {
             Line {
                 rect: rect.unwrap(),
                 conf: words.iter().map(|w| w.4).sum::<f32>() / words.len() as f32,
-                text: words.into_iter().map(|w| w.5).collect::<Vec<_>>().join(" "),
+                text: words.iter().map(|w| w.5.as_str()).collect::<Vec<_>>().join(" "),
+                words: words.into_iter().map(|w| (Rect { x0: w.0, y0: w.1, x1: w.0 + w.2, y1: w.1 + w.3 }, w.5)).collect(),
             }
         })
         .collect()
@@ -227,7 +247,23 @@ fn clean_word(word: &str) -> Option<String> {
 
 /// Merge lines into bubbles: sorted top to bottom, a line joins a group when the gap to
 /// the group's bottom is under 1.3x the line height and they overlap horizontally >= 30%.
-pub fn merge_lines(mut lines: Vec<Line>) -> Vec<Bubble> {
+#[cfg(test)] // the app uses group_lines + a re-read; tests check the grouping rules
+pub fn merge_lines(lines: Vec<Line>) -> Vec<Bubble> {
+    group_lines(lines)
+        .into_iter()
+        .map(|g| group_bubble(&g))
+        .filter(|b| looks_like_text(&b.text, b.conf))
+        .collect()
+}
+
+fn group_bubble(g: &[Line]) -> Bubble {
+    let rect = g.iter().skip(1).fold(g[0].rect, |r, l| r.union(&l.rect));
+    let conf = g.iter().map(|l| l.conf).sum::<f32>() / g.len() as f32;
+    Bubble { rect, conf, text: join_lines(g.iter().map(|l| l.text.as_str())), edited: None, raw: None }
+}
+
+/// Group lines into bubbles (see [`merge_lines`]), without the junk filter.
+fn group_lines(mut lines: Vec<Line>) -> Vec<Vec<Line>> {
     lines.sort_by(|a, b| a.rect.y0.total_cmp(&b.rect.y0));
     let mut groups: Vec<Vec<Line>> = Vec::new();
     for line in lines {
@@ -244,14 +280,6 @@ pub fn merge_lines(mut lines: Vec<Line>) -> Vec<Bubble> {
         }
     }
     groups
-        .into_iter()
-        .map(|g| {
-            let rect = g.iter().skip(1).fold(g[0].rect, |r, l| r.union(&l.rect));
-            let conf = g.iter().map(|l| l.conf).sum::<f32>() / g.len() as f32;
-            Bubble { rect, conf, text: join_lines(g.iter().map(|l| l.text.as_str())), edited: None, raw: None }
-        })
-        .filter(|b| looks_like_text(&b.text, b.conf))
-        .collect()
 }
 
 /// Reject OCR read from artwork. Tuned on Eleceed ch 1.2 (2026-11-23): of 271 candidates
@@ -340,28 +368,36 @@ pub fn ocr_band(
         let (w, h) = ((img.width() as f32 * scale) as u32, (img.height() as f32 * scale) as u32);
         img = image::imageops::resize(&img, w, h, image::imageops::FilterType::CatmullRom);
     }
-    let unscale = |lines: Vec<Line>| -> Vec<Line> {
-        lines
-            .into_iter()
-            .map(|mut l| {
-                l.rect = Rect { x0: l.rect.x0 / scale, y0: l.rect.y0 / scale, x1: l.rect.x1 / scale, y1: l.rect.y1 / scale };
-                l
-            })
-            .collect()
-    };
-    let mut lines = unscale(engine.lines(&img)?);
+    let mut lines = engine.lines(&img)?;
     // Glowing light-on-dark lettering ("IF IT WISHES TO SHINE" over a starry sky) reads as
     // junk; a hard black/white version of the band reads it fine. Only dark bands get the
     // second pass (about 1 in 15 on Star-Embracing Swordmaster), so it costs little.
     if mean_luma(&img) < DARK_BAND_MEAN {
         let bw = threshold_dark_text(&img);
-        lines = merge_passes(lines, unscale(engine.lines(&bw)?));
+        lines = merge_passes(lines, engine.lines(&bw)?);
     }
+    // The sparse pass finds text well but reads some clean bubbles badly, depending on
+    // scale ("LET'S GET OUT" -> "LET;:S:bEEE ouT"). Re-read each bubble on its own as a text
+    // block and keep the better reading.
+    let mut bubbles: Vec<Bubble> = Vec::new();
+    for g in group_lines(lines) {
+        let sparse = group_bubble(&g);
+        let reread = reread_block(engine, &img, &g)?;
+        let pick = match reread {
+            Some(b) if better_reading(&b, &sparse) => b,
+            _ => sparse,
+        };
+        if looks_like_text(&pick.text, pick.conf) {
+            bubbles.push(pick);
+        }
+    }
+    let bubbles = dedupe_overlapping(bubbles);
     let top = band.y0.floor();
-    let bubbles: Vec<Bubble> = merge_lines(lines)
+    let bubbles: Vec<Bubble> = bubbles
         .into_iter()
         .map(|mut b| {
-            b.rect = b.rect.shifted(top);
+            b.rect = Rect { x0: b.rect.x0 / scale, y0: b.rect.y0 / scale, x1: b.rect.x1 / scale, y1: b.rect.y1 / scale }
+                .shifted(top);
             b
         })
         .collect();
@@ -375,6 +411,93 @@ pub fn ocr_band(
         })
         .collect();
     Ok(BandResult { band: index, bubbles, clipped })
+}
+
+/// Re-read a group of lines as one text block, from a crop padded by about a line height
+/// (so a line the sparse pass missed, like "AH, YES." above, is read too). `None` if the
+/// crop is too small or nothing was read. Coordinates stay in the band image's pixels.
+fn reread_block(engine: &dyn OcrEngine, img: &GrayImage, group: &[Line]) -> Result<Option<Bubble>, String> {
+    let rect = group.iter().skip(1).fold(group[0].rect, |r, l| r.union(&l.rect));
+    let lh = group.iter().map(|l| l.rect.h()).sum::<f32>() / group.len() as f32;
+    if rect.w() < 8.0 || lh < 6.0 {
+        return Ok(None);
+    }
+    let (pad_x, pad_y) = (0.8 * lh, 1.3 * lh);
+    let x0 = (rect.x0 - pad_x).max(0.0) as u32;
+    let y0 = (rect.y0 - pad_y).max(0.0) as u32;
+    let x1 = ((rect.x1 + pad_x) as u32).min(img.width());
+    let y1 = ((rect.y1 + pad_y) as u32).min(img.height());
+    if x1 <= x0 + 4 || y1 <= y0 + 4 {
+        return Ok(None);
+    }
+    let crop = image::imageops::crop_imm(img, x0, y0, x1 - x0, y1 - y0).to_image();
+    let lines = engine.block(&crop)?;
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    let shift = |r: Rect| Rect { x0: r.x0 + x0 as f32, y0: r.y0 + y0 as f32, x1: r.x1 + x0 as f32, y1: r.y1 + y0 as f32 };
+    // The padding also picks up the bubble's outline, read as stray letters ("4 N W-WHAT
+    // ... Y"): drop 1-2 character words that lie outside the text the sparse pass found.
+    let core = Rect { x0: rect.x0 - 0.3 * lh, y0: rect.y0 - 0.2 * lh, x1: rect.x1 + 0.3 * lh, y1: rect.y1 + 0.2 * lh };
+    let lines: Vec<Line> = lines
+        .into_iter()
+        .filter_map(|mut l| {
+            let words: Vec<(Rect, String)> = l
+                .words
+                .iter()
+                .map(|(r, w)| (shift(*r), w.clone()))
+                .filter(|(r, w)| w.chars().count() > 2 || r.intersection(&core) > 0.5 * r.area())
+                .collect();
+            let first = words.first()?;
+            l.rect = words.iter().skip(1).fold(first.0, |acc, (r, _)| acc.union(r));
+            l.text = words.iter().map(|(_, w)| w.as_str()).collect::<Vec<_>>().join(" ");
+            l.words = words;
+            Some(l)
+        })
+        .collect();
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    let mut lines = lines;
+    lines.sort_by(|a, b| a.rect.y0.total_cmp(&b.rect.y0));
+    Ok(Some(group_bubble(&lines)))
+}
+
+/// Letters weighted by confidence, minus a penalty for junk characters.
+fn reading_score(b: &Bubble) -> f32 {
+    const NEUTRAL: &str = ".,!?'-…:;’\"";
+    let letters = b.text.chars().filter(|c| c.is_alphabetic()).count() as f32;
+    let junk = b.text.chars().filter(|c| !c.is_alphanumeric() && !c.is_whitespace() && !NEUTRAL.contains(*c)).count() as f32;
+    (letters - 3.0 * junk) * b.conf
+}
+
+/// Whether the block re-read should replace the sparse reading: when the sparse one is
+/// junk, when the re-read keeps every letter at about the same confidence, or when it's
+/// clearly better. A re-read that drops a word ("DID [YOU] COMMIT") loses.
+fn better_reading(reread: &Bubble, sparse: &Bubble) -> bool {
+    if !looks_like_text(&reread.text, reread.conf) {
+        return false;
+    }
+    let letters = |b: &Bubble| b.text.chars().filter(|c| c.is_alphabetic()).count();
+    let (new, old) = (reading_score(reread), reading_score(sparse));
+    !looks_like_text(&sparse.text, sparse.conf)
+        || (letters(reread) >= letters(sparse) && new >= 0.9 * old)
+        || new >= 1.25 * old
+}
+
+/// Two re-reads of neighbouring groups can return the same bubble ("LET'S GO GET THE" and
+/// "GET THE TEMS!" both re-read as the whole bubble): keep the better of overlapping ones.
+fn dedupe_overlapping(mut bubbles: Vec<Bubble>) -> Vec<Bubble> {
+    bubbles.sort_by(|a, b| reading_score(b).total_cmp(&reading_score(a)));
+    let mut kept: Vec<Bubble> = Vec::new();
+    for b in bubbles {
+        let dup = kept.iter().any(|k| k.rect.intersection(&b.rect) > 0.5 * k.rect.area().min(b.rect.area()));
+        if !dup {
+            kept.push(b);
+        }
+    }
+    kept.sort_by(|a, b| a.rect.y0.total_cmp(&b.rect.y0));
+    kept
 }
 
 /// Bands darker than this (mean grey, 0-255) also get the thresholded OCR pass.
@@ -643,7 +766,7 @@ mod tests {
     use super::*;
 
     fn line(x0: f32, y0: f32, x1: f32, y1: f32, t: &str) -> Line {
-        Line { rect: Rect { x0, y0, x1, y1 }, text: t.into(), conf: 90.0 }
+        Line { rect: Rect { x0, y0, x1, y1 }, text: t.into(), conf: 90.0, words: Vec::new() }
     }
 
     #[test]
