@@ -65,6 +65,10 @@ pub struct App {
     settings_draft: Option<(Settings, String)>,
     reader: Option<Reader>,
     stats: Option<crate::stats_page::StatsPage>,
+    /// The last removal and when it happened, for the undo popup.
+    undo: Option<(crate::library::Removal, std::time::Instant)>,
+    /// Series (source, title) waiting for "Remove series?" confirmation.
+    confirm_remove: Option<(String, String)>,
     title: String,
 }
 
@@ -87,6 +91,8 @@ impl App {
             settings_draft: None,
             reader: None,
             stats: None,
+            undo: None,
+            confirm_remove: None,
             title: String::new(),
         };
         if let Some(p) = open {
@@ -331,6 +337,8 @@ impl App {
         };
         let s = self.lib.series[i].clone();
         let mut open = None;
+        let mut remove_chapter: Option<usize> = None;
+        let mut restore_removed = false;
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
@@ -350,6 +358,13 @@ impl App {
                 {
                     self.sync(vec![s.phone_series()]);
                 }
+                if ui
+                    .small_button("Remove series")
+                    .on_hover_text("Move its chapters to the Trash and hide it. Your stats stay. Add it from the phone again to bring it back.")
+                    .clicked()
+                {
+                    self.confirm_remove = Some((s.source.clone(), s.title.clone()));
+                }
                 if let Some(ci) = s.continue_index() {
                     let c = &s.chapters[ci];
                     let verb = if c.started() { "Continue" } else { "Read" };
@@ -362,6 +377,15 @@ impl App {
                 }
             });
         });
+        if !s.meta.removed.is_empty() {
+            ui.horizontal(|ui| {
+                let n = s.meta.removed.len();
+                ui.label(RichText::new(format!("{n} chapter{} removed from the PC (stats kept)", if n == 1 { "" } else { "s" })).color(DIM));
+                if ui.small_button("Restore").on_hover_text("Sync will copy them from the phone again").clicked() {
+                    restore_removed = true;
+                }
+            });
+        }
         ui.add_space(6.0);
         ui.separator();
 
@@ -370,19 +394,31 @@ impl App {
         }
         let row_h = 26.0;
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, s.chapters.len(), |ui, range| {
-            for c in &s.chapters[range] {
+            for (k, c) in s.chapters[range.clone()].iter().enumerate() {
+                let index = range.start + k;
                 ui.horizontal(|ui| {
                     ui.set_min_height(row_h);
                     let (sym, color, tip) = mark_style(c.mark);
                     ui.label(RichText::new(sym).color(color).monospace()).on_hover_text(tip);
                     let name = RichText::new(&c.display_name).size(15.0);
-                    ui.label(if c.finished() { name.color(DIM) } else { name });
+                    if c.removed {
+                        ui.label(name.color(Color32::from_gray(90)).strikethrough());
+                        ui.label(RichText::new("removed").color(Color32::from_gray(90)).italics());
+                    } else {
+                        ui.label(if c.finished() { name.color(DIM) } else { name });
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let verb = if c.finished() { "Read again" } else if c.started() { "Continue" } else { "Read" };
-                        if ui.button(verb).clicked() {
-                            open = Some(c.path.clone());
+                        if !c.removed {
+                            if ui.small_button("✕").on_hover_text("Remove from the PC (file to the Trash, stats kept)").clicked() {
+                                remove_chapter = Some(index);
+                            }
+                            let verb = if c.finished() { "Read again" } else if c.started() { "Continue" } else { "Read" };
+                            if ui.button(verb).clicked() {
+                                open = Some(c.path.clone());
+                            }
                         }
-                        ui.label(RichText::new(progress_text(c)).color(if c.finished() { GOOD } else { DIM }));
+                        let color = if c.removed { Color32::from_gray(90) } else if c.finished() { GOOD } else { DIM };
+                        ui.label(RichText::new(progress_text(c)).color(color));
                     });
                 });
             }
@@ -390,6 +426,89 @@ impl App {
 
         if let Some(p) = open {
             self.open(ctx, &p);
+        }
+        if let Some(index) = remove_chapter {
+            let c = &s.chapters[index];
+            match crate::library::remove(&s, &[c], false, c.display_name.clone()) {
+                Ok(r) => self.undo = Some((r, std::time::Instant::now())),
+                Err(e) => self.error = Some((format!("Couldn't remove {}: {e}", c.display_name), false)),
+            }
+            self.reload();
+        }
+        if restore_removed {
+            if let Err(e) = crate::library::restore_removed(&s) {
+                self.error = Some((format!("Couldn't restore: {e}"), false));
+            }
+            self.reload();
+        }
+    }
+
+    /// "Remove series?" confirmation.
+    fn confirm_remove_dialog(&mut self, ctx: &egui::Context) {
+        let Some((source, title)) = self.confirm_remove.clone() else { return };
+        let Some(s) = self.lib.series.iter().find(|s| s.source == source && s.title == title).cloned() else {
+            self.confirm_remove = None;
+            return;
+        };
+        let (mut yes, mut no) = (false, false);
+        egui::Modal::new(egui::Id::unique("confirm-remove")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.heading(format!("Remove {}?", s.title));
+            ui.add_space(6.0);
+            let files = s.chapters.iter().filter(|c| !c.removed).count();
+            ui.label(format!("Its {files} chapter file{} and their scans go to the Trash, and the series is hidden from the library.", if files == 1 { "" } else { "s" }));
+            ui.label("Your reading stats for it stay on the stats page. To bring it back, add it from your phone again.");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                yes = ui.add(egui::Button::new(RichText::new("Remove series").strong()).fill(Color32::from_rgb(120, 50, 50))).clicked();
+                no = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+            });
+        });
+        if yes {
+            let all: Vec<&LocalChapter> = s.chapters.iter().collect();
+            match crate::library::remove(&s, &all, true, s.title.clone()) {
+                Ok(r) => self.undo = Some((r, std::time::Instant::now())),
+                Err(e) => self.error = Some((format!("Couldn't remove {}: {e}", s.title), false)),
+            }
+            self.confirm_remove = None;
+            self.selected = None;
+            self.reload();
+        } else if no {
+            self.confirm_remove = None;
+        }
+    }
+
+    /// "Removed X · Undo" at the bottom for a while after a removal.
+    fn undo_popup(&mut self, ctx: &egui::Context) {
+        const SHOW_FOR: std::time::Duration = std::time::Duration::from_secs(20);
+        let Some((r, at)) = &self.undo else { return };
+        if at.elapsed() > SHOW_FOR {
+            self.undo = None;
+            return;
+        }
+        let label = r.label.clone();
+        let (mut undo, mut close) = (false, false);
+        egui::Area::new(egui::Id::unique("undo-popup"))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).inner_margin(10.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Removed {label} (moved to the Trash, stats kept)"));
+                        undo = ui.button(RichText::new("Undo").strong()).clicked();
+                        close = ui.small_button("✕").clicked();
+                    });
+                });
+            });
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        if undo {
+            if let Some((r, _)) = self.undo.take() {
+                if let Err(e) = r.undo() {
+                    self.error = Some((format!("Undo didn't fully work: {e}"), false));
+                }
+                self.reload();
+            }
+        } else if close {
+            self.undo = None;
         }
     }
 
@@ -690,6 +809,8 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| self.series_view(ui, &ctx));
         self.add_dialog(&ctx);
         self.settings_dialog(&ctx);
+        self.confirm_remove_dialog(&ctx);
+        self.undo_popup(&ctx);
     }
 }
 

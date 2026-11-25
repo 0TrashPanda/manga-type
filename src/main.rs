@@ -30,6 +30,7 @@ mod reader;
 mod settings;
 mod stats_page;
 mod sync;
+mod trash;
 mod typing;
 
 /// Debug: write each OCR band with bubble boxes drawn on it (red) and their index.

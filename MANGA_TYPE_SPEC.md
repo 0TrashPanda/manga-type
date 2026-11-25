@@ -54,6 +54,7 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
   - every downloaded chapter missing on the PC
   - only chapters after the last one finished in manga-type
 - Phone files are never modified or deleted.
+- Removing (2026-11-25, user's choice: keep stats, Trash, undo popup): a chapter's "✕" or a series' "Remove series" (with a confirmation) moves the chapter files and OCR scans to the desktop Trash (freedesktop spec, `src/trash.rs`), keeps the progress files (stats), and records the file names in `SeriesMeta::removed` so Sync never copies them again. Removed chapters with progress stay listed (struck through, "removed") and count on the stats page; a removed series is hidden (`SeriesMeta::hidden`) but still counts. "Restore" forgets the removed list so the next Sync copies them again; adding a removed series from the phone brings it back. An undo popup (20 s) puts the files back from the Trash and restores the series settings.
 - Finishing a chapter: offer the next chapter.
 - Implemented (2026-11-24, `src/library.rs`, `src/sync.rs`, `src/app.rs`):
   - Library folder (setting, default `~/Manga`): `<Source (EN)>/<Series>/<chapter>.cbz`, same names as on the phone. A series = a folder; no separate index.

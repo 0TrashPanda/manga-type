@@ -121,7 +121,8 @@ impl Inner {
             Cmd::Connect { library } => self.with_retry(|w| w.connect(&library)),
             Cmd::Chapters(series) => self.with_retry(|w| w.chapters(&series)),
             Cmd::Add { library, series, start_from } => {
-                let meta = SeriesMeta { start_from: start_from.clone() };
+                // Adding again (also a removed series) starts fresh: shown, nothing removed.
+                let meta = SeriesMeta { start_from: start_from.clone(), ..Default::default() };
                 let dir = library.join(&series.source).join(&series.title);
                 if let Err(e) = meta.save(&dir) {
                     self.error(&PhoneError::Other(format!("couldn't create {}: {e}", dir.display())));
@@ -232,8 +233,10 @@ impl Inner {
             }
             let chapters = self.ordered_chapters(s)?;
             let local_series = lib.series.iter().find(|l| l.source == s.source && l.title == s.title);
-            let local: HashSet<String> =
-                local_series.map(|l| l.chapters.iter().map(|c| c.file_name.clone()).collect()).unwrap_or_default();
+            // On the PC, or removed from it (never copied again unless restored).
+            let local: HashSet<String> = local_series
+                .map(|l| l.chapters.iter().map(|c| c.file_name.clone()).chain(l.meta.removed.iter().cloned()).collect())
+                .unwrap_or_default();
             let finished: HashSet<String> = local_series
                 .map(|l| l.chapters.iter().filter(|c| c.finished()).map(|c| c.file_name.clone()).collect())
                 .unwrap_or_default();

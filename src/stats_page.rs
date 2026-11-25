@@ -58,7 +58,8 @@ impl StatsPage {
         let mut series = Vec::new();
         let mut done_chapters: Vec<(u64, String, f32, f32)> = Vec::new();
         let mut chapter_words: Vec<(u64, String, u64, bool)> = Vec::new();
-        for s in &lib.series {
+        // Removed series still count.
+        for s in lib.series.iter().chain(&lib.removed_series) {
             let mut row = SeriesRow { title: s.title.clone(), chapters: s.chapters.len(), finished: 0, reading: 0.0, stats: Stats::default(), words: (0, false) };
             for c in &s.chapters {
                 let Some(p) = &c.progress else { continue };

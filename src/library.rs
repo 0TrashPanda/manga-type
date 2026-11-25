@@ -112,6 +112,12 @@ fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String>
 pub struct SeriesMeta {
     /// Phone file name of the first chapter to copy; earlier chapters are never synced.
     pub start_from: Option<String>,
+    /// Chapters removed from the PC (file names): Sync doesn't copy them again, and the
+    /// ones with progress stay listed (greyed out) so their stats count.
+    pub removed: Vec<String>,
+    /// The whole series was removed: hidden from the library, stats still count.
+    /// Adding it again from the phone clears this.
+    pub hidden: bool,
 }
 
 impl SeriesMeta {
@@ -171,6 +177,8 @@ pub struct LocalChapter {
     pub display_name: String,
     pub mark: Mark,
     pub progress: Option<ChapterProgress>,
+    /// Removed from the PC (file in the Trash); kept for its stats, can't be read.
+    pub removed: bool,
 }
 
 impl LocalChapter {
@@ -187,6 +195,7 @@ impl LocalChapter {
 pub struct LocalSeries {
     pub source: String,
     pub title: String,
+    pub dir: PathBuf,
     pub meta: SeriesMeta,
     /// In reading order.
     pub chapters: Vec<LocalChapter>,
@@ -214,13 +223,13 @@ impl LocalSeries {
     /// The chapter to open with "Continue": the one in progress, else the first unfinished
     /// one after the last finished, else the first unfinished.
     pub fn continue_index(&self) -> Option<usize> {
-        if let Some(i) = self.chapters.iter().position(|c| c.started() && !c.finished()) {
+        if let Some(i) = self.chapters.iter().position(|c| !c.removed && c.started() && !c.finished()) {
             return Some(i);
         }
         let after = self.chapters.iter().rposition(LocalChapter::finished).map_or(0, |i| i + 1);
         (after..self.chapters.len())
             .chain(0..after)
-            .find(|&i| !self.chapters[i].finished())
+            .find(|&i| !self.chapters[i].finished() && !self.chapters[i].removed)
     }
 }
 
@@ -257,18 +266,21 @@ pub fn reading_order<T>(items: &mut [T], file_name: impl Fn(&T) -> &str, display
 
 pub struct Library {
     pub series: Vec<LocalSeries>,
+    /// Series removed from the library; kept for the stats page.
+    pub removed_series: Vec<LocalSeries>,
 }
 
 impl Library {
     pub fn load(root: &Path) -> Self {
         let backup = load_backup(root);
-        let mut series = Vec::new();
+        let (mut series, mut removed_series) = (Vec::new(), Vec::new());
         for source_dir in subdirs(root) {
             for dir in subdirs(&source_dir) {
-                series.push(load_series(&source_dir, &dir, backup.as_ref()));
+                let s = load_series(&source_dir, &dir, backup.as_ref());
+                if s.meta.hidden { removed_series.push(s) } else { series.push(s) }
             }
         }
-        Self { series }
+        Self { series, removed_series }
     }
 
     pub fn contains(&self, s: &phone::Series) -> bool {
@@ -279,7 +291,7 @@ impl Library {
     pub fn next_after(&self, path: &Path) -> Option<PathBuf> {
         for s in &self.series {
             if let Some(i) = s.chapters.iter().position(|c| c.path == path) {
-                return s.chapters.get(i + 1).map(|c| c.path.clone());
+                return s.chapters[i + 1..].iter().find(|c| !c.removed).map(|c| c.path.clone());
             }
         }
         next_in_folder(path)
@@ -302,11 +314,102 @@ fn load_series(source_dir: &Path, dir: &Path, backup: Option<&Backup>) -> LocalS
                 progress: ChapterProgress::load(&path),
                 file_name,
                 path,
+                removed: false,
             }
         })
         .collect();
+    let meta = SeriesMeta::load(dir);
+    // Removed chapters with progress stay listed for their stats.
+    for name in &meta.removed {
+        let path = dir.join(name);
+        if path.exists() || chapters.iter().any(|c| &c.file_name == name) {
+            continue;
+        }
+        if let Some(progress) = ChapterProgress::load(&path) {
+            chapters.push(LocalChapter {
+                display_name: phone::display_name(name),
+                mark: mark(bs, name),
+                progress: Some(progress),
+                file_name: name.clone(),
+                path,
+                removed: true,
+            });
+        }
+    }
     reading_order(&mut chapters, |c| &c.file_name, |c| &c.display_name, bs);
-    LocalSeries { source, title, meta: SeriesMeta::load(dir), chapters }
+    LocalSeries { source, title, dir: dir.to_path_buf(), meta, chapters }
+}
+
+// ---------------------------------------------------------------------------
+// Removing chapters and series (to the Trash, stats kept)
+// ---------------------------------------------------------------------------
+
+/// What a removal did, so it can be undone.
+pub struct Removal {
+    /// "Chapter 3" or the series title, for the undo popup.
+    pub label: String,
+    dir: PathBuf,
+    previous_meta: SeriesMeta,
+    trashed: Vec<crate::trash::Trashed>,
+}
+
+impl Removal {
+    /// Put the files back from the Trash and restore the series settings.
+    pub fn undo(self) -> Result<(), String> {
+        let errors: Vec<String> = self.trashed.iter().filter_map(|t| crate::trash::restore(t).err()).collect();
+        self.previous_meta.save(&self.dir)?;
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    }
+}
+
+/// Move chapters' files and OCR scans to the Trash, keep their progress (stats), and
+/// remember them so Sync doesn't copy them again. With `whole_series`, also hide the
+/// series. If a file can't be trashed, everything already moved is put back.
+pub fn remove(series: &LocalSeries, chapters: &[&LocalChapter], whole_series: bool, label: String) -> Result<Removal, String> {
+    remove_with(series, chapters, whole_series, label, &crate::trash::trash)
+}
+
+fn remove_with(
+    series: &LocalSeries,
+    chapters: &[&LocalChapter],
+    whole_series: bool,
+    label: String,
+    trash: &dyn Fn(&Path) -> Result<crate::trash::Trashed, String>,
+) -> Result<Removal, String> {
+    let previous_meta = series.meta.clone();
+    let mut trashed = Vec::new();
+    for c in chapters.iter().filter(|c| !c.removed) {
+        for path in [c.path.clone(), crate::ocr::cache_path(&c.path)] {
+            if !path.exists() {
+                continue;
+            }
+            match trash(&path) {
+                Ok(t) => trashed.push(t),
+                Err(e) => {
+                    for t in &trashed {
+                        let _ = crate::trash::restore(t);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+    let mut meta = series.meta.clone();
+    for c in chapters {
+        if !meta.removed.contains(&c.file_name) {
+            meta.removed.push(c.file_name.clone());
+        }
+    }
+    meta.hidden |= whole_series;
+    meta.save(&series.dir)?;
+    Ok(Removal { label, dir: series.dir.clone(), previous_meta, trashed })
+}
+
+/// Forget removed chapters, so the next Sync copies them again (their stats carry on).
+pub fn restore_removed(series: &LocalSeries) -> Result<(), String> {
+    let mut meta = series.meta.clone();
+    meta.removed.clear();
+    meta.save(&series.dir)
 }
 
 /// For a chapter opened outside the library: the next chapter in the same folder.
@@ -447,6 +550,52 @@ mod tests {
         assert_eq!(s.word_count(), (100, true));
         s.words = 93;
         assert_eq!(s.word_count(), (93, false));
+    }
+
+
+    #[test]
+    fn remove_keeps_stats_and_undoes() {
+        let root = std::env::temp_dir().join(format!("manga-type-remove-{}", std::process::id()));
+        let dir = root.join("Src (EN)").join("Series");
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["Chapter 1_aaaaaa.cbz", "Chapter 2_bbbbbb.cbz", "Chapter 3_cccccc.cbz"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        std::fs::write(dir.join("Chapter 1_aaaaaa.cbz.manga-type.json"), b"{}").unwrap();
+        let mut p = ChapterProgress { finished: true, ..Default::default() };
+        p.stats.words = 120;
+        p.save(&dir.join("Chapter 1_aaaaaa.cbz")).unwrap();
+        let trash_dir = std::env::temp_dir().join(format!("manga-type-remove-trash-{}", std::process::id()));
+        let trash = |path: &Path| crate::trash::trash_in(path, &trash_dir);
+
+        // Remove chapter 1 (read) and 2 (unread).
+        let lib = Library::load(&root);
+        let s = &lib.series[0];
+        let r = remove_with(s, &[&s.chapters[0], &s.chapters[1]], false, "x".into(), &trash).unwrap();
+        assert!(!dir.join("Chapter 1_aaaaaa.cbz").exists() && !dir.join("Chapter 1_aaaaaa.cbz.manga-type.json").exists());
+        let lib = Library::load(&root);
+        let s = &lib.series[0];
+        let names: Vec<(&str, bool)> = s.chapters.iter().map(|c| (c.display_name.as_str(), c.removed)).collect();
+        assert_eq!(names, [("Chapter 1", true), ("Chapter 3", false)], "read one kept for stats, unread one gone");
+        assert_eq!(s.words(), (120, false));
+        assert_eq!(s.meta.removed.len(), 2, "both skipped by Sync");
+        assert_eq!(s.continue_index(), Some(1));
+
+        // Undo puts everything back.
+        r.undo().unwrap();
+        let lib = Library::load(&root);
+        assert_eq!(lib.series[0].chapters.len(), 3);
+        assert!(lib.series[0].meta.removed.is_empty());
+
+        // Whole series: hidden, stats kept.
+        let s = &lib.series[0];
+        let all: Vec<&LocalChapter> = s.chapters.iter().collect();
+        remove_with(s, &all, true, "Series".into(), &trash).unwrap();
+        let lib = Library::load(&root);
+        assert!(lib.series.is_empty());
+        assert_eq!(lib.removed_series[0].words(), (120, false));
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&trash_dir).unwrap();
     }
 
 }
