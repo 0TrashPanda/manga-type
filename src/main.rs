@@ -3,6 +3,7 @@
 //!
 //!   manga-type                             open the app
 //!   manga-type read <chapter>              open the app on one chapter
+//!   manga-type stats                       open the app on the stats page
 //!   manga-type add <series#> [chapter#]    add a series to the library like the app does
 //!                                          (from chapter#, default all) and copy it
 //!   manga-type sync                        Sync all, like the app's button
@@ -17,13 +18,17 @@
 
 mod app;
 mod fix;
+mod history;
+mod kinds;
 mod library;
 mod mihon;
 mod ocr;
+mod paddle;
 mod pages;
 mod phone;
 mod reader;
 mod settings;
+mod stats_page;
 mod sync;
 mod typing;
 
@@ -203,21 +208,23 @@ fn run(args: &[String]) -> Result<(), PhoneError> {
             let path = args.get(1).ok_or(PhoneError::Other("expected chapter path".into()))?;
             let p = Path::new(path);
             let p = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-            app::run(Some(p)).map_err(PhoneError::Other)?;
+            app::run(Some(p), false).map_err(PhoneError::Other)?;
         }
         Some("ocr") => {
             // ocr <chapter> [annotated-out-dir]
             let path = args.get(1).ok_or(PhoneError::Other("expected chapter path".into()))?;
             let ch = std::sync::Arc::new(pages::Chapter::open(Path::new(path)).map_err(PhoneError::Other)?);
             let t = Instant::now();
-            let raw = if let Some(c) = ocr::load_cache(&ch) {
+            let (engine, note) = ocr::engine().map_err(PhoneError::Other)?;
+            if let Some(n) = note {
+                eprintln!("{n}");
+            }
+            let raw = if let Some(c) = ocr::load_cache(&ch, engine.name()) {
                 println!("loaded cache {}", ocr::cache_path(&ch.path).display());
                 c.bubbles
             } else {
-                let tess = ocr::Tesseract::default();
-                tess.check().map_err(PhoneError::Other)?;
                 let workers = ocr::default_workers();
-                let scan = ocr::Scan::start(ch.clone(), std::sync::Arc::new(tess), workers);
+                let scan = ocr::Scan::start(ch.clone(), engine.clone(), workers);
                 let total = scan.bands.len();
                 let mut results = Vec::new();
                 let mut first_ready = None;
@@ -242,11 +249,11 @@ fn run(args: &[String]) -> Result<(), PhoneError> {
                     first_ready.unwrap_or(0.0)
                 );
                 let raw = ocr::combine(&results);
-                ocr::save_cache(&ch, &raw).map_err(PhoneError::Other)?;
+                ocr::save_cache(&ch, &raw, engine.name()).map_err(PhoneError::Other)?;
                 raw
             };
             let dict = fix::Dictionary::load_or_build().inspect_err(|e| eprintln!("word correction off: {e}")).ok();
-            let bubbles = ocr::finish(&ch, &raw, dict.as_ref());
+            let bubbles = ocr::finish(&ch, &raw, dict.as_ref(), engine.name());
             let corrected = bubbles.iter().filter(|b| b.raw.is_some()).count();
             println!(
                 "{} raw bubbles -> {} after dropping ad/credit pages; {corrected} bubbles corrected",
@@ -255,6 +262,20 @@ fn run(args: &[String]) -> Result<(), PhoneError> {
             );
             for (i, b) in bubbles.iter().enumerate() {
                 println!("{i:3} y{:>7.0} conf{:>3.0}  {}", b.rect.y0, b.conf, b.target());
+            }
+            // What the keep/drop rules (kinds.rs) left out, for checking them.
+            let no_ads = ocr::drop_ad_pages(&ch, raw.clone());
+            let ctx = kinds::Context::new(&no_ads, dict.as_ref());
+            for b in &no_ads {
+                let k = kinds::classify(b, &ctx);
+                if k != kinds::Kind::Speech {
+                    println!(
+                        "  dropped {k:?} y{:>7.0} framed {:.2}  {}",
+                        b.rect.y0,
+                        b.framed.unwrap_or(f32::NAN),
+                        b.text
+                    );
+                }
             }
             if let Some(dir) = args.get(2) {
                 annotate(&ch, &bubbles, Path::new(dir)).map_err(PhoneError::Other)?;
@@ -342,11 +363,13 @@ fn run(args: &[String]) -> Result<(), PhoneError> {
             eprintln!();
             println!("copied to {} in {secs:.1}s ({:.1} MB/s)", out.display(), last as f64 / 1e6 / secs);
         }
-        None => app::run(None).map_err(PhoneError::Other)?,
+        None => app::run(None, false).map_err(PhoneError::Other)?,
+        Some("stats") => app::run(None, true).map_err(PhoneError::Other)?,
         _ => {
             eprintln!(
                 "usage: manga-type                      open the app\n\
                  \x20      manga-type read <chapter>       open the app on one chapter\n\
+                 \x20      manga-type stats                 open the app on the stats page\n\
                  \x20      manga-type series | chapters <n> | pull <series#> <chapter#> <dest> | stop-adb\n\
                  \x20      manga-type progress | pages <chapter> | bands <chapter> <dir> | ocr <chapter> [dir]"
             );

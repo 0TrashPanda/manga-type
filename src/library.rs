@@ -43,8 +43,21 @@ pub struct ChapterProgress {
     pub finished: bool,
     /// Totals over the whole chapter.
     pub stats: Stats,
+    /// Time spent with the chapter open while active (gaps over a minute count as a
+    /// minute), across every read of it.
+    pub reading_seconds: f64,
     /// Unix seconds of the last save.
     pub updated: u64,
+}
+
+/// "45s", "12m", "1h 05m".
+pub fn format_duration(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        _ => format!("{}h {:02}m", s / 3600, s / 60 % 60),
+    }
 }
 
 pub fn progress_path(chapter: &Path) -> PathBuf {
@@ -164,6 +177,11 @@ pub struct LocalSeries {
 impl LocalSeries {
     pub fn phone_series(&self) -> phone::Series {
         phone::Series { source: self.source.clone(), title: self.title.clone() }
+    }
+
+    /// Time spent reading this series (all chapters).
+    pub fn reading_seconds(&self) -> f64 {
+        self.chapters.iter().filter_map(|c| c.progress.as_ref()).map(|p| p.reading_seconds).sum()
     }
 
     pub fn finished_count(&self) -> usize {

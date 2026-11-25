@@ -8,6 +8,7 @@
 //! Case is its own setting ([`CaseMode`]): exact, ignored, or "first letter capitalized",
 //! which turns ALL-CAPS lettering into sentence case and has you type that.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -311,10 +312,23 @@ impl Typing {
 /// WPM and accuracy over a stretch of typing (a bubble or a chapter).
 /// Time counts only while typing: gaps longer than [`Stats::MAX_GAP`] between keys
 /// (reading the page, getting a drink) are capped.
+/// Right and wrong presses for one expected character.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KeyCount {
+    pub hit: u32,
+    pub miss: u32,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
     pub correct: u64,
     pub wrong: u64,
+    /// Per expected character (as shown in the bubble's typing target).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: BTreeMap<char, KeyCount>,
+    /// Wrong presses as "expected→typed" ("e→r"), with counts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub typos: BTreeMap<String, u32>,
     /// Wrong letters left in when a bubble ended ([`ErrorMode::Keep`]); each costs a word.
     #[serde(default)]
     pub uncorrected: u64,
@@ -329,6 +343,18 @@ impl Stats {
 
     pub fn key(&mut self, correct: bool) {
         self.key_at(correct, Instant::now());
+    }
+
+    /// A press while `expected` was the next character; `typed` is what was pressed.
+    pub fn key_char(&mut self, expected: char, typed: char, correct: bool) {
+        self.key(correct);
+        let k = self.keys.entry(expected).or_default();
+        if correct {
+            k.hit += 1;
+        } else {
+            k.miss += 1;
+            *self.typos.entry(format!("{expected}→{typed}")).or_default() += 1;
+        }
     }
 
     fn key_at(&mut self, correct: bool, now: Instant) {
@@ -361,6 +387,14 @@ impl Stats {
         self.wrong += other.wrong;
         self.uncorrected += other.uncorrected;
         self.seconds += other.seconds;
+        for (c, k) in &other.keys {
+            let e = self.keys.entry(*c).or_default();
+            e.hit += k.hit;
+            e.miss += k.miss;
+        }
+        for (t, n) in &other.typos {
+            *self.typos.entry(t.clone()).or_default() += n;
+        }
     }
 }
 
@@ -512,6 +546,23 @@ mod tests {
     fn old_stats_files_load() {
         let s: Stats = serde_json::from_str(r#"{"correct":3,"wrong":1,"seconds":2.0}"#).unwrap();
         assert_eq!(s.uncorrected, 0);
+    }
+
+
+    #[test]
+    fn per_key_counts_merge() {
+        let mut a = Stats::default();
+        a.key_char('e', 'e', true);
+        a.key_char('e', 'r', false);
+        let mut b = Stats::default();
+        b.key_char('e', 'r', false);
+        b.key_char(' ', ' ', true);
+        a.merge(&b);
+        assert_eq!(a.keys[&'e'], KeyCount { hit: 1, miss: 2 });
+        assert_eq!(a.typos["e→r"], 2);
+        let json = serde_json::to_string(&a).unwrap();
+        let back: Stats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.keys[&' '], KeyCount { hit: 1, miss: 0 });
     }
 
 }

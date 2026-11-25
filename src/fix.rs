@@ -115,7 +115,7 @@ impl Dictionary {
         Ok(Self::from_words(text.lines().map(str::to_string)))
     }
 
-    fn contains(&self, w: &str) -> bool {
+    pub(crate) fn contains(&self, w: &str) -> bool {
         let n = normalize(w);
         // The list spells contractions both with and without the apostrophe.
         self.words.contains(&n) || self.common.contains(n.as_str())
@@ -290,6 +290,36 @@ pub fn correct_bubbles(bubbles: &mut [Bubble], dict: &Dictionary) -> usize {
         }
     }
     changed
+}
+
+/// Cleanup for an accurate engine (PaddleOCR): characters outside Latin text dropped
+/// ("BUT YOU... 气"), stray lowercase in all-caps lettering upper-cased ("Again! I KNEW"),
+/// lone marks at the ends trimmed. No dictionary guessing.
+pub fn light_fix_bubbles(bubbles: &mut [Bubble]) -> usize {
+    let mut changed = 0;
+    for b in bubbles.iter_mut().filter(|b| b.edited.is_none()) {
+        let fixed = light_fix(&b.text);
+        if fixed != b.text {
+            changed += 1;
+            if b.raw.is_none() {
+                b.raw = Some(b.text.clone());
+            }
+            b.text = fixed;
+        }
+    }
+    changed
+}
+
+fn light_fix(text: &str) -> String {
+    let kept: String = text
+        .chars()
+        .filter(|c| c.is_ascii() || matches!(c, '’' | '‘' | '“' | '”' | '…' | '—' | '–') || c.is_alphabetic() && (*c as u32) < 0x250)
+        .collect();
+    let letters: Vec<char> = kept.chars().filter(|c| c.is_alphabetic()).collect();
+    let upper = letters.iter().filter(|c| c.is_uppercase()).count();
+    let all_caps = letters.len() >= 4 && upper * 10 >= letters.len() * 6;
+    let text = if all_caps { kept.to_uppercase() } else { kept };
+    trim_stray_marks(&text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 fn fix_text(text: &str, dict: &Dictionary, active: &[usize], changed: &mut usize) -> String {
@@ -627,7 +657,7 @@ mod tests {
     }
 
     fn bubble(t: &str) -> Bubble {
-        Bubble { rect: Rect { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0 }, text: t.into(), conf: 90.0, edited: None, raw: None }
+        Bubble { rect: Rect { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0 }, text: t.into(), conf: 90.0, edited: None, raw: None, framed: None }
     }
 
     fn fix(texts: &[&str]) -> Vec<String> {
@@ -763,6 +793,16 @@ mod tests {
         let _ = fix_tokens("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH! WHAT", &d, &mut n);
         let _ = fix_tokens("WAAAAAAAAAHHHHHHHHHHHHHHHHHHHHHHHH!! HUH", &d, &mut n);
         assert!(t.elapsed().as_millis() < 100);
+    }
+
+
+    #[test]
+    fn light_fix_keeps_names_and_numbers() {
+        assert_eq!(light_fix("MONSTER LV. 1"), "MONSTER LV. 1");
+        assert_eq!(light_fix("DON'T GET WORKED UP ABOUT THIS, ZEMINA."), "DON'T GET WORKED UP ABOUT THIS, ZEMINA.");
+        assert_eq!(light_fix("Again! I KNEW YOU'D BE HERE."), "AGAIN! I KNEW YOU'D BE HERE.");
+        assert_eq!(light_fix("BUT YOU... 气"), "BUT YOU...");
+        assert_eq!(light_fix("CAFÉ au lait"), "CAFÉ au lait", "mixed case stays");
     }
 
 }

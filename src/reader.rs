@@ -22,7 +22,7 @@ use eframe::egui::{
 
 use crate::fix::Dictionary;
 use crate::library::ChapterProgress;
-use crate::ocr::{self, BandResult, Bubble, Scan, ScanEvent, Tesseract};
+use crate::ocr::{self, BandResult, Bubble, Scan, ScanEvent};
 use crate::pages::Chapter;
 use crate::settings::{ScrollMode, Settings};
 use crate::typing::{CaseMode, Stats, Typing};
@@ -40,6 +40,8 @@ const REVEAL: f32 = 0.85;
 const ZOOM_MIN: f32 = 0.3;
 const ZOOM_MAX: f32 = 4.0;
 const ZOOM_STEP: f32 = 1.15;
+/// Longest gap between inputs that still counts as time spent reading.
+const IDLE_CAP: Duration = Duration::from_secs(60);
 /// j / k / arrow keys scroll this fraction of the window height.
 const LINE_STEP: f32 = 0.12;
 /// Padding around a bubble's text box when drawing its highlight (strip px).
@@ -105,6 +107,8 @@ pub struct Reader {
     pub settings: Settings,
     /// A dialog of the app is open on top: don't take keys.
     pub paused: bool,
+    /// OCR engine of this chapter's scan (and its cache).
+    engine_name: String,
     /// The chapter after this one, offered when this one is finished.
     next: Option<PathBuf>,
     /// A progress file existed when opened (so an empty position is still worth saving).
@@ -119,6 +123,12 @@ pub struct Reader {
     manual_target: f32,
     /// You've typed the first letter of the current bubble: from now on j / k / Space type.
     typing_started: bool,
+    /// Time spent on this chapter (saved with the progress).
+    reading_seconds: f64,
+    /// Last input (key, mouse, scroll) while the window had focus.
+    last_activity: Option<std::time::Instant>,
+    /// State when the chapter was opened, for the session log.
+    session_start: (f64, Stats, usize),
     /// Screen points per strip pixel (from the last frame; 0 before the first).
     scale: f32,
     /// Sideways offset of the page in screen points, when zoomed wider than the window.
@@ -201,6 +211,7 @@ impl Reader {
             chapter_stats: Stats::default(),
             settings,
             paused: false,
+            engine_name: String::new(),
             next,
             had_progress: false,
             finished: false,
@@ -208,6 +219,9 @@ impl Reader {
             scroll: 0.0,
             manual_target: 0.0,
             typing_started: false,
+            reading_seconds: 0.0,
+            last_activity: None,
+            session_start: (0.0, Stats::default(), 0),
             scale: 0.0,
             pan_x: 0.0,
             start_scroll: 0.0,
@@ -222,7 +236,10 @@ impl Reader {
         };
 
         // A finished chapter opens from the start again ("Read again"); otherwise resume.
-        if let Some(p) = ChapterProgress::load(&ch.path).filter(|p| !p.finished) {
+        let saved = ChapterProgress::load(&ch.path);
+        // Time spent carries over every read, also "Read again" on a finished chapter.
+        r.reading_seconds = saved.as_ref().map_or(0.0, |p| p.reading_seconds);
+        if let Some(p) = saved.filter(|p| !p.finished) {
             r.had_progress = true;
             r.current = p.current;
             r.states = p
@@ -235,7 +252,13 @@ impl Reader {
             r.restore_pending = r.current > 0;
         }
 
-        if let Some(cache) = ocr::load_cache(&ch) {
+        let engine = ocr::engine();
+        if let Ok((e, note)) = &engine {
+            r.engine_name = e.name().to_string();
+            r.notice = note.clone();
+        }
+        r.session_start = (r.reading_seconds, r.chapter_stats.clone(), r.current);
+        if let Some(cache) = ocr::load_cache(&ch, &r.engine_name) {
             for b in &cache.bubbles {
                 if let Some(e) = &b.edited {
                     r.edits.insert(rect_key(b), e.clone());
@@ -243,10 +266,9 @@ impl Reader {
             }
             r.raw_done = Some(cache.bubbles);
         } else {
-            let tess = Tesseract::default();
-            match tess.check() {
-                Ok(()) => {
-                    let scan = Scan::start(ch, Arc::new(tess), r.settings.ocr_workers());
+            match engine {
+                Ok((e, _)) => {
+                    let scan = Scan::start(ch, e, r.settings.ocr_workers());
                     r.bands_total = scan.bands.len();
                     r.scan = Some(scan);
                 }
@@ -276,7 +298,7 @@ impl Reader {
             },
         };
         let raw = self.with_edits(raw);
-        self.bubbles = ocr::finish(&self.ch, &raw, self.dict.as_deref());
+        self.bubbles = ocr::finish(&self.ch, &raw, self.dict.as_deref(), &self.engine_name);
         // Never shrink: restored marks may run ahead of a scan that's still going.
         if self.states.len() < self.bubbles.len() {
             self.states.resize(self.bubbles.len(), State::Todo);
@@ -296,7 +318,7 @@ impl Reader {
 
     fn save_cache(&self) {
         if let Some(raw) = &self.raw_done
-            && let Err(e) = ocr::save_cache(&self.ch, &self.with_edits(raw.clone()))
+            && let Err(e) = ocr::save_cache(&self.ch, &self.with_edits(raw.clone()), &self.engine_name)
         {
             eprintln!("couldn't save OCR cache: {e}");
         }
@@ -417,8 +439,8 @@ impl Reader {
     /// Save position and stats next to the chapter.
     pub fn save_progress(&mut self) {
         let stats = self.total_stats();
-        if !self.had_progress && self.current == 0 && stats.correct + stats.wrong == 0 {
-            return; // opened and closed without typing: leave no file behind
+        if !self.had_progress && self.current == 0 && stats.correct + stats.wrong == 0 && self.reading_seconds < 10.0 {
+            return; // opened and closed without doing anything: leave no file behind
         }
         let states = self.states[..self.current.min(self.states.len())]
             .iter()
@@ -430,6 +452,7 @@ impl Reader {
             bubbles: if self.raw_done.is_some() { self.bubbles.len() } else { 0 },
             finished: self.finished,
             stats,
+            reading_seconds: self.reading_seconds,
             updated: 0,
         };
         match p.save(&self.ch.path) {
@@ -600,10 +623,11 @@ impl Reader {
                             }
                             self.typing_started = true;
                         }
-                        if let Some(t) = &mut self.typing
-                            && let Some(ok) = t.type_char(c)
-                        {
-                            self.bubble_stats.key(ok);
+                        if let Some(t) = &mut self.typing {
+                            let expected = t.chars.get(t.pos).copied();
+                            if let Some(ok) = t.type_char(c) {
+                                self.bubble_stats.key_char(expected.unwrap_or(c), c, ok);
+                            }
                         }
                     }
                 }
@@ -865,6 +889,9 @@ impl Reader {
             ui.separator();
             ui.label(format!("{:.1}% accuracy", total.accuracy()));
             ui.separator();
+            ui.label(egui::RichText::new(crate::library::format_duration(self.reading_seconds)).color(DIM_TEXT))
+                .on_hover_text("Time spent on this chapter");
+            ui.separator();
             if ui.add_enabled(!done, egui::Button::new("Skip  (Tab)")).clicked() {
                 self.advance(State::Skipped);
             }
@@ -927,9 +954,29 @@ impl Reader {
         &self.ch.path
     }
 
+    /// Count time between inputs while the window has focus; a gap over [`IDLE_CAP`]
+    /// counts as that much (looking at a page, not away from the computer).
+    fn track_time(&mut self, ctx: &egui::Context) {
+        let (active, focused) = ctx.input(|i| {
+            (!i.events.is_empty() || i.pointer.is_moving() || i.smooth_scroll_delta != egui::Vec2::ZERO, i.focused)
+        });
+        if !focused {
+            self.last_activity = None;
+            return;
+        }
+        if active {
+            let now = std::time::Instant::now();
+            if let Some(t) = self.last_activity {
+                self.reading_seconds += now.duration_since(t).min(IDLE_CAP).as_secs_f64();
+            }
+            self.last_activity = Some(now);
+        }
+    }
+
     /// Draw one frame. Returns what the app should do next, if anything.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let ctx = ui.ctx().clone();
+        self.track_time(&ctx);
         self.poll_background();
         let mut action = None;
 
@@ -997,8 +1044,40 @@ impl Reader {
     }
 }
 
+impl Reader {
+    /// Append this visit to the session log (if anything happened).
+    fn log_session(&self) {
+        let (read0, stats0, current0) = &self.session_start;
+        let total = self.total_stats();
+        let seconds = self.reading_seconds - read0;
+        let correct = total.correct.saturating_sub(stats0.correct);
+        if seconds < 5.0 && correct == 0 {
+            return;
+        }
+        let name = |p: Option<&std::path::Path>| {
+            p.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        };
+        let s = crate::history::Session {
+            ended: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+            series: name(self.ch.path.parent()),
+            chapter: crate::phone::display_name(&name(Some(&self.ch.path))),
+            seconds,
+            correct,
+            wrong: total.wrong.saturating_sub(stats0.wrong),
+            uncorrected: total.uncorrected.saturating_sub(stats0.uncorrected),
+            typing_seconds: (total.seconds - stats0.seconds).max(0.0),
+            bubbles: self.current.saturating_sub(*current0),
+            finished: self.finished,
+        };
+        if let Err(e) = crate::history::append(&s) {
+            eprintln!("couldn't log the session: {e}");
+        }
+    }
+}
+
 impl Drop for Reader {
     fn drop(&mut self) {
         self.save_progress();
+        self.log_session();
     }
 }

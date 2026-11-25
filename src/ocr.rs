@@ -26,7 +26,9 @@ const MIN_WORD_CONF: f32 = 45.0;
 /// Bump when the merge/filter rules change, so old caches get re-scanned.
 // 10: second, thresholded OCR pass on dark bands (glowing light-on-dark lettering).
 // 11: every bubble re-read on its own as a text block (psm 6), better reading kept.
-const CACHE_VERSION: u32 = 11;
+// 12: caches record their engine (PaddleOCR replaces Tesseract when its models are there).
+// 13: bubbles record how plain the background around their lines is (`framed`).
+const CACHE_VERSION: u32 = 13;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -99,6 +101,11 @@ pub struct Bubble {
     /// OCR text before automatic word correction (`fix.rs`), if it changed anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
+    /// How plain the background right around each text line is (0-1, mean over lines):
+    /// ~1 inside speech bubbles and boxes, lower for text on art or textured game windows.
+    /// `None` when not measured (Tesseract path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framed: Option<f32>,
 }
 
 impl Bubble {
@@ -116,6 +123,40 @@ pub trait OcrEngine: Send + Sync {
     fn block(&self, img: &GrayImage) -> Result<Vec<Line>, String> {
         self.lines(img)
     }
+    /// Stored in the OCR cache: a cache from another engine is rescanned.
+    fn name(&self) -> &'static str {
+        "tesseract"
+    }
+    /// Tesseract needs help: upscaling, a thresholded pass on dark bands, and a block
+    /// re-read of every bubble. PaddleOCR reads the band as it is.
+    fn workarounds(&self) -> bool {
+        true
+    }
+}
+
+/// An engine plus an optional note for the user (why it isn't PaddleOCR), or why there's none.
+pub type EngineChoice = Result<(Arc<dyn OcrEngine>, Option<String>), String>;
+
+/// The OCR engine to use, loaded once per run: PaddleOCR when its models are installed
+/// (`scripts/install.sh`), else Tesseract. The second value is a note for the user when
+/// falling back.
+pub fn engine() -> EngineChoice {
+    static ENGINE: std::sync::OnceLock<EngineChoice> = std::sync::OnceLock::new();
+    ENGINE
+        .get_or_init(|| match crate::paddle::Paddle::load_default() {
+            Ok(p) => Ok((Arc::new(p) as Arc<dyn OcrEngine>, None)),
+            Err(paddle_err) => {
+                let tess = Tesseract::default();
+                match tess.check() {
+                    Ok(()) => Ok((
+                        Arc::new(tess) as Arc<dyn OcrEngine>,
+                        Some(format!("Using Tesseract (much less accurate): {paddle_err}. Run scripts/install.sh to get PaddleOCR.")),
+                    )),
+                    Err(e) => Err(format!("No OCR engine: {paddle_err}; {e}")),
+                }
+            }
+        })
+        .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +300,7 @@ pub fn merge_lines(lines: Vec<Line>) -> Vec<Bubble> {
 fn group_bubble(g: &[Line]) -> Bubble {
     let rect = g.iter().skip(1).fold(g[0].rect, |r, l| r.union(&l.rect));
     let conf = g.iter().map(|l| l.conf).sum::<f32>() / g.len() as f32;
-    Bubble { rect, conf, text: join_lines(g.iter().map(|l| l.text.as_str())), edited: None, raw: None }
+    Bubble { rect, conf, text: join_lines(g.iter().map(|l| l.text.as_str())), edited: None, raw: None, framed: None }
 }
 
 /// Group lines into bubbles (see [`merge_lines`]), without the junk filter.
@@ -360,7 +401,27 @@ pub fn ocr_band(
     band: Band,
     cache: &mut PageCache,
 ) -> Result<BandResult, String> {
-    let mut img = ch.render_band(band, cache)?;
+    let img = ch.render_band(band, cache)?;
+    if !engine.workarounds() {
+        // PaddleOCR: detect and read text lines on the band as it is, group into bubbles.
+        let top = band.y0.floor();
+        let bubbles: Vec<Bubble> = group_lines(engine.lines(&img)?)
+            .into_iter()
+            .map(|g| {
+                let mut b = group_bubble(&g);
+                let rings: Vec<f32> = g.iter().filter_map(|l| plain_ring(&img, &l.rect)).collect();
+                b.framed = (!rings.is_empty()).then(|| rings.iter().sum::<f32>() / rings.len() as f32);
+                b
+            })
+            .filter(|b| looks_like_text(&b.text, b.conf))
+            .map(|mut b| {
+                b.rect = b.rect.shifted(top);
+                b
+            })
+            .collect();
+        return Ok(band_result(ch, index, band, bubbles));
+    }
+    let mut img = img;
     // Tesseract does much better on larger lettering: on a 690 px Eleceed page, 2x fixed
     // dropped words ("ABLE TO GIVE": TO went from confidence 41 to 87) and misreads.
     let scale = ocr_scale(ch.strip_width);
@@ -401,6 +462,10 @@ pub fn ocr_band(
             b
         })
         .collect();
+    Ok(band_result(ch, index, band, bubbles))
+}
+
+fn band_result(ch: &Chapter, index: usize, band: Band, bubbles: Vec<Bubble>) -> BandResult {
     // Text within this margin of a cut (not the strip's own ends) may be cut off.
     let margin = 12.0;
     let clipped = bubbles
@@ -410,7 +475,7 @@ pub fn ocr_band(
                 || (band.y1 < ch.strip_height - 0.5 && b.rect.y1 > band.y1 - margin)
         })
         .collect();
-    Ok(BandResult { band: index, bubbles, clipped })
+    BandResult { band: index, bubbles, clipped }
 }
 
 /// Re-read a group of lines as one text block, from a crop padded by about a line height
@@ -500,6 +565,32 @@ fn dedupe_overlapping(mut bubbles: Vec<Bubble>) -> Vec<Bubble> {
     kept
 }
 
+/// Share of pixels in a thin ring around a text line that are within 25 grey levels of
+/// the ring's median: ~1 on a plain bubble (white, black or grey), lower on art.
+fn plain_ring(img: &GrayImage, r: &Rect) -> Option<f32> {
+    let pad = (0.25 * r.h()).max(3.0);
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let (x0, y0) = ((r.x0 - pad).max(0.0) as u32, (r.y0 - pad).max(0.0) as u32);
+    let (x1, y1) = ((r.x1 + pad).min(w) as u32, (r.y1 + pad).min(h) as u32);
+    let mut px: Vec<u8> = Vec::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let inside = fx >= r.x0 && fx < r.x1 && fy >= r.y0 && fy < r.y1;
+            if !inside {
+                px.push(img.get_pixel(x, y).0[0]);
+            }
+        }
+    }
+    if px.len() < 20 {
+        return None;
+    }
+    let mut sorted = px.clone();
+    sorted.sort_unstable();
+    let med = sorted[sorted.len() / 2] as i16;
+    Some(px.iter().filter(|&&p| (p as i16 - med).abs() <= 25).count() as f32 / px.len() as f32)
+}
+
 /// Bands darker than this (mean grey, 0-255) also get the thresholded OCR pass.
 const DARK_BAND_MEAN: f32 = 100.0;
 
@@ -587,14 +678,19 @@ pub fn reading_order(bubbles: &mut [Bubble]) {
 /// Text that marks a scanlator ad or credits page rather than story.
 const AD_MARKERS: &[&str] = &[
     "MANHUATOP", "DISCORD", "PATREON", "KO-FI", "KOFI", "SCANS", "BOOKMARK", "WWW.", ".COM", ".GG",
-    "TRANSLATOR", "PROOFREADER", "TYPESETTER", "QUALITY CHECK", "REDRAWER", "CLEANER",
+    "TRANSLATOR", "PROOFREADER", "TYPESETTER", "QUALITY CHECK", "REDRAWER", "CLEANER", "STUDIO",
 ];
 
 /// Remove scanlator ads, credits and watermarks:
 /// - a bubble with ad text is always dropped (watermarks like `FLAMESCANS.ORG` sit
 ///   inside story pages, so only that bubble goes);
 /// - on the first or last two page images, ad text that isn't just a watermark
-///   (`READ ON MANHUATOP?`, `TRANSLATOR`, `JOIN OUR DISCORD`) drops the whole page.
+///   (`READ ON MANHUATOP?`, `TRANSLATOR`, `JOIN OUR DISCORD`) drops the rest of that
+///   image toward the chapter's edge: everything above it (plus [`AD_MARGIN`] below) at
+///   the start, everything below it (plus the margin above) at the end. Mihon images can
+///   be very tall, and the last one often ends the story right above the "READ AT
+///   ASURASCANS.COM" banner (Star-Embracing Swordmaster ch 1 lost its last 4 lines when
+///   the whole image went).
 ///
 /// Checked on the user's chapters: ManhuaTop's ~20-bubble banner and end page,
 /// ZeroScans/Asura credit pages and Asura's novel plug are removed; FlameScans and
@@ -606,30 +702,57 @@ pub fn drop_ad_pages(ch: &Chapter, bubbles: Vec<Bubble>) -> Vec<Bubble> {
     };
     let is_ad = |b: &Bubble| {
         let t = b.text.to_uppercase();
-        AD_MARKERS.iter().any(|m| t.contains(m))
+        // Also with spaces removed: logos letter-spaced like "S T U D I O".
+        let squeezed: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+        AD_MARKERS.iter().any(|m| t.contains(m) || squeezed.contains(m))
     };
     // Just a site name: one token once stray punctuation is trimmed.
     let is_watermark = |b: &Bubble| b.text.trim_matches(|c: char| !c.is_alphanumeric()).split_whitespace().count() <= 1;
     let n = ch.pages.len();
-    let edge = |p: usize| p < 2 || p + 2 >= n;
-    let bad_pages: Vec<usize> = bubbles
-        .iter()
-        .filter(|b| is_ad(b) && !is_watermark(b))
-        .filter_map(|b| page_of(b))
-        .filter(|&p| edge(p))
-        .collect();
+    // Per page: drop above this y (start of chapter) / below this y (end of chapter).
+    let mut cut_above: Vec<Option<f32>> = vec![None; n];
+    let mut cut_below: Vec<Option<f32>> = vec![None; n];
+    for b in bubbles.iter().filter(|b| is_ad(b) && !is_watermark(b)) {
+        let Some(p) = page_of(b) else { continue };
+        if p < 2 {
+            let y = b.rect.y1 + AD_MARGIN;
+            cut_above[p] = Some(cut_above[p].map_or(y, |c: f32| c.max(y)));
+        }
+        if p + 2 >= n {
+            let y = b.rect.y0 - AD_MARGIN;
+            cut_below[p] = Some(cut_below[p].map_or(y, |c: f32| c.min(y)));
+        }
+    }
     bubbles
         .into_iter()
-        .filter(|b| !is_ad(b) && page_of(b).is_none_or(|p| !bad_pages.contains(&p)))
+        .filter(|b| {
+            if is_ad(b) {
+                return false;
+            }
+            let Some(p) = page_of(b) else { return true };
+            let cy = (b.rect.y0 + b.rect.y1) / 2.0;
+            !(cut_above[p].is_some_and(|c| cy < c) || cut_below[p].is_some_and(|c| cy > c))
+        })
         .collect()
 }
 
+/// How far around an ad on the first/last images credits and banner text still go.
+const AD_MARGIN: f32 = 300.0;
+
 /// Raw OCR bubbles -> what the reader shows: ad pages dropped, words corrected.
 /// Cheap (milliseconds), so it runs on every load and rule changes need no rescan.
-pub fn finish(ch: &Chapter, raw: &[Bubble], dict: Option<&super::fix::Dictionary>) -> Vec<Bubble> {
-    let mut out = drop_ad_pages(ch, raw.to_vec());
-    if let Some(d) = dict {
-        super::fix::correct_bubbles(&mut out, d);
+/// `engine` is the [`OcrEngine::name`] that read them: Tesseract's text gets the full
+/// dictionary correction; PaddleOCR's is near-perfect already, and those rules mostly
+/// broke it ("LV. 1" -> "LV. I", "ZEMINA" -> "ZEMIN A"), so it only gets light cleanup.
+pub fn finish(ch: &Chapter, raw: &[Bubble], dict: Option<&super::fix::Dictionary>, engine: &str) -> Vec<Bubble> {
+    // Only text the user types: speech and narration (no SFX, game windows, side chatter).
+    let mut out = crate::kinds::keep_typeable(drop_ad_pages(ch, raw.to_vec()), dict);
+    if engine == "tesseract" {
+        if let Some(d) = dict {
+            super::fix::correct_bubbles(&mut out, d);
+        }
+    } else {
+        super::fix::light_fix_bubbles(&mut out);
     }
     out
 }
@@ -639,6 +762,9 @@ pub fn finish(ch: &Chapter, raw: &[Bubble], dict: Option<&super::fix::Dictionary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OcrCache {
     pub version: u32,
+    /// [`OcrEngine::name`] of the engine that made it.
+    #[serde(default)]
+    pub engine: String,
     pub strip_width: u32,
     pub strip_height: f32,
     pub bubbles: Vec<Bubble>,
@@ -651,19 +777,21 @@ pub fn cache_path(chapter_path: &Path) -> PathBuf {
 }
 
 /// Load a cache if it exists and matches this chapter's layout and the current rules.
-pub fn load_cache(ch: &Chapter) -> Option<OcrCache> {
+pub fn load_cache(ch: &Chapter, engine: &str) -> Option<OcrCache> {
     let text = std::fs::read_to_string(cache_path(&ch.path)).ok()?;
     let c: OcrCache = serde_json::from_str(&text).ok()?;
     (c.version == CACHE_VERSION
+        && c.engine == engine
         && c.strip_width == ch.strip_width
         && (c.strip_height - ch.strip_height).abs() < 1.0)
         .then_some(c)
 }
 
 /// Save atomically (write temp, rename) so a crash never leaves a half-written cache.
-pub fn save_cache(ch: &Chapter, bubbles: &[Bubble]) -> Result<(), String> {
+pub fn save_cache(ch: &Chapter, bubbles: &[Bubble], engine: &str) -> Result<(), String> {
     let c = OcrCache {
         version: CACHE_VERSION,
+        engine: engine.to_string(),
         strip_width: ch.strip_width,
         strip_height: ch.strip_height,
         bubbles: bubbles.to_vec(),
@@ -744,9 +872,38 @@ impl Drop for Scan {
     }
 }
 
-/// Default worker count: one per core, capped at 6, leaving one core for the UI.
+/// Default worker count: the machine's physical cores (at most 16, and never more than
+/// the threads this process may use). Past the physical cores, workers share cores and
+/// each band costs more CPU (Regressor ch 2 on a 12-core / 24-thread Ryzen AI 9 HX 370:
+/// 6 workers 27.0 s / 1.4 GB, 12 workers 21.5 s / 2.5 GB, 22 workers 20.0 s / 4.1 GB
+/// using 4x the CPU time). `MANGA_TYPE_WORKERS` overrides it; so does the setting.
 pub fn default_workers() -> usize {
-    thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(1).clamp(1, 6)
+    if let Some(n) = std::env::var("MANGA_TYPE_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return n.max(1);
+    }
+    let threads = thread::available_parallelism().map_or(2, |n| n.get());
+    // Unknown topology (not Linux): assume two threads per core.
+    let cores = physical_cores().unwrap_or(threads / 2);
+    cores.min(threads).clamp(1, 16)
+}
+
+/// Physical cores, from Linux's CPU topology: distinct (package, core) pairs over the
+/// CPUs in `/sys/devices/system/cpu`. `None` when that isn't available.
+pub fn physical_cores() -> Option<usize> {
+    let mut cores = std::collections::HashSet::new();
+    for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.strip_prefix("cpu").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
+            continue;
+        }
+        let topo = entry.path().join("topology");
+        let read = |f: &str| std::fs::read_to_string(topo.join(f)).ok().map(|s| s.trim().to_string());
+        if let (Some(pkg), Some(core)) = (read("physical_package_id"), read("core_id")) {
+            cores.insert((pkg, core));
+        }
+    }
+    (!cores.is_empty()).then_some(cores.len())
 }
 
 /// Bubbles that are final given which bands are done: everything above the first
@@ -829,6 +986,7 @@ mod tests {
             conf: 90.0,
             edited: None,
             raw: None,
+            framed: None,
         };
         let results = vec![
             BandResult { band: 0, bubbles: vec![bub(100.0, 50.0, "A"), bub(1990.0, 50.0, "CUT")], clipped: vec![false, true] },
@@ -849,6 +1007,17 @@ mod tests {
         let mut texts: Vec<String> = merge_passes(base, extra).into_iter().map(|l| l.text).collect();
         texts.sort();
         assert_eq!(texts, ["'HM SHINE", "IF IT WISHES", "NEW"]);
+    }
+
+
+    #[test]
+    fn worker_default_is_sane() {
+        let threads = thread::available_parallelism().map_or(2, |n| n.get());
+        if let Some(c) = physical_cores() {
+            assert!(c >= 1 && c <= threads, "{c} cores, {threads} threads");
+        }
+        let w = default_workers();
+        assert!((1..=16).contains(&w));
     }
 
 }

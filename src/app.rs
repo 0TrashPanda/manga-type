@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::library::{Library, LocalChapter, Mark};
+use crate::library::{Library, LocalChapter, Mark, format_duration};
 use crate::pages::Chapter;
 use crate::phone::{self, Series};
 use crate::reader::{self, Reader};
@@ -64,11 +64,12 @@ pub struct App {
     add: Option<AddDialog>,
     settings_draft: Option<(Settings, String)>,
     reader: Option<Reader>,
+    stats: Option<crate::stats_page::StatsPage>,
     title: String,
 }
 
 impl App {
-    fn new(ctx: &egui::Context, open: Option<PathBuf>) -> Self {
+    fn new(ctx: &egui::Context, open: Option<PathBuf>, stats: bool) -> Self {
         let settings = Settings::load();
         let lib = Library::load(&settings.library);
         let selected = lib.series.first().map(|s| (s.source.clone(), s.title.clone()));
@@ -85,10 +86,14 @@ impl App {
             add: None,
             settings_draft: None,
             reader: None,
+            stats: None,
             title: String::new(),
         };
         if let Some(p) = open {
             app.open(ctx, &p);
+        }
+        if stats {
+            app.stats = Some(crate::stats_page::StatsPage::new(&app.lib));
         }
         app
     }
@@ -206,6 +211,10 @@ impl App {
                 if ui.button("Settings").clicked() {
                     self.settings_draft = Some((self.settings.clone(), self.settings.library.display().to_string()));
                 }
+                if ui.button("Stats").clicked() {
+                    self.reload();
+                    self.stats = Some(crate::stats_page::StatsPage::new(&self.lib));
+                }
                 let can_sync = !busy && !self.lib.series.is_empty();
                 if ui
                     .add_enabled(can_sync, egui::Button::new("Sync all"))
@@ -286,7 +295,11 @@ impl App {
                 let mut job = egui::text::LayoutJob::default();
                 job.append(&text, 0.0, egui::TextFormat::simple(egui::FontId::proportional(15.0), ui.visuals().strong_text_color()));
                 job.append(
-                    &format!("{} · {} chapters · {} finished", s.source, s.chapters.len(), s.finished_count()),
+                    &{
+                        let t = s.reading_seconds();
+                        let time = if t >= 1.0 { format!(" · {}", format_duration(t)) } else { String::new() };
+                        format!("{} · {} chapters · {} finished{time}", s.source, s.chapters.len(), s.finished_count())
+                    },
                     0.0,
                     egui::TextFormat::simple(egui::FontId::proportional(12.0), DIM),
                 );
@@ -320,7 +333,9 @@ impl App {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.heading(RichText::new(&s.title).strong());
-                ui.label(RichText::new(&s.source).color(DIM));
+                let t = s.reading_seconds();
+                let spent = if t >= 1.0 { format!(" · {} spent", format_duration(t)) } else { String::new() };
+                ui.label(RichText::new(format!("{}{spent}", s.source)).color(DIM));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let busy = self.worker.busy();
@@ -652,6 +667,16 @@ impl eframe::App for App {
             return;
         }
 
+        if let Some(page) = &self.stats {
+            set_title(&ctx, &mut self.title, "manga-type — stats".into());
+            let mut back = false;
+            egui::CentralPanel::default().show(ui, |ui| back = page.show(ui));
+            if back {
+                self.stats = None;
+            }
+            return;
+        }
+
         set_title(&ctx, &mut self.title, "manga-type".into());
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         if self.copy.is_some() {
@@ -707,21 +732,26 @@ fn mark_style(m: Mark) -> (&'static str, Color32, &'static str) {
 }
 
 fn progress_text(c: &LocalChapter) -> String {
+    let time = |p: &crate::library::ChapterProgress| {
+        if p.reading_seconds >= 1.0 { format!(" · {}", format_duration(p.reading_seconds)) } else { String::new() }
+    };
     match &c.progress {
-        Some(p) if p.finished => format!("finished · {:.0} WPM · {:.0}%", p.stats.wpm(), p.stats.accuracy()),
+        Some(p) if p.finished => format!("finished · {:.0} WPM · {:.0}%{}", p.stats.wpm(), p.stats.accuracy(), time(p)),
         Some(p) if p.current > 0 || p.stats.correct > 0 => {
             if p.bubbles > 0 {
-                format!("bubble {} / {}", p.current + 1, p.bubbles)
+                format!("bubble {} / {}{}", p.current + 1, p.bubbles, time(p))
             } else {
-                format!("bubble {}", p.current + 1)
+                format!("bubble {}{}", p.current + 1, time(p))
             }
         }
+        Some(p) if p.reading_seconds >= 1.0 => format_duration(p.reading_seconds),
         _ => String::new(),
     }
 }
 
-/// Open the app window; with `open`, go straight to that chapter.
-pub fn run(open: Option<PathBuf>) -> Result<(), String> {
+/// Open the app window; with `open`, go straight to that chapter; with `stats`, to the
+/// stats page.
+pub fn run(open: Option<PathBuf>, stats: bool) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("manga-type")
@@ -736,7 +766,7 @@ pub fn run(open: Option<PathBuf>) -> Result<(), String> {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             // Ctrl +/- zooms the manga page in the reader, not the whole interface.
             cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
-            Ok(Box::new(App::new(&cc.egui_ctx, open)))
+            Ok(Box::new(App::new(&cc.egui_ctx, open, stats)))
         }),
     )
     .map_err(|e| e.to_string())

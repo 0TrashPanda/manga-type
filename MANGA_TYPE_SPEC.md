@@ -18,10 +18,11 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
 ## Stack (decided)
 - Rust.
 - GUI: `egui` / `eframe`.
-- OCR: `tesseract` CLI as a subprocess (`--psm 11`, TSV output, `eng`), behind a small internal OCR trait (image in -> lines with box, text, confidence out) so `ocrs` can be tried later.
+- OCR (changed 2026-11-25, user's choice after a benchmark): **PaddleOCR PP-OCRv6 small** (text detection + recognition ONNX models) run with `tract` (pure Rust, no system libraries), in `src/paddle.rs`. Models in `~/.local/share/manga-type/models/`, downloaded and SHA256-checked by `scripts/install.sh`. Without them the app falls back to the `tesseract` CLI (`--psm 11`, TSV, `eng`) and says so. Both sit behind the `OcrEngine` trait; caches record the engine, so a different engine rescans.
+- OCR benchmark (61 bubble crops from Regressor Instruction Manual ch 2 + Star-Embracing Swordmaster ch 1, ground truth typed from the images): word error rate Tesseract 33.6%, Tesseract tessdata_best 33.3%, ocrs 20.4%, PaddleOCR v6 0.5-0.9% (with its angle classifier off; on, it flips short words: "NO" -> "¿NO", 4.9%). End to end (detection, grouping, cleanup): Tesseract pipeline 7.5%, PaddleOCR 2.3%. Fine-tuning Tesseract was not tried: it would have had to go from 33% to under 1%.
 - Phone: `adb_client` crate (pure Rust), direct USB, reusing the existing key `~/.android/adbkey`. No external `adb` binary.
 - Other crates (expected): `image` (webp/jpg/png), `zip` (cbz), `natord`, `serde` + `serde_json`, `directories`, `flate2` (Mihon backup), std threads + channels for workers.
-- System deps: `sudo pacman -S tesseract tesseract-data-eng`.
+- System deps: `sudo pacman -S tesseract tesseract-data-eng` (the fallback OCR, and its word list for `fix.rs`).
 
 ## Phone / Mihon (verified on the user's phone)
 - Mihon storage root: `/storage/emulated/0/Books/Tachiyomi/` (NOT `Mihon/`). Contains `downloads/`, `local/`, `autobackup/`. No SD card.
@@ -92,6 +93,9 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
 - Bottom bar: bubble text with typed part coloured, bubble counter, live WPM and accuracy, skip + edit buttons.
 
 ## OCR details
+- PaddleOCR path (`paddle.rs`, mirrors RapidOCR): detection on each band as-is (shorter side >= 736, rounded to /32, normalised (x/255-0.5)/0.5), DB post-processing (threshold 0.3, 2x2 dilation, box score >= 0.5, unclip 1.6; axis-aligned boxes since comic text is upright), recognition per line at height 48 (width padded to 160 buckets so few model variants get optimised), greedy CTC decode with the character list from the model's metadata, lines under 0.5 confidence dropped. Lines then go through the same grouping into bubbles, junk filter and ad removal. No angle classifier, no upscaling, no dark-band pass, no block re-read: those are Tesseract workarounds. Scan time: ~27 s for Regressor ch 2, ~53 s for Star-Embracing Swordmaster ch 1 (6 workers); first bubbles after ~3 s.
+- Word correction (`fix.rs`) is only for Tesseract text. On PaddleOCR text it mostly did harm ("LV. 1" -> "LV. I", "ZEMINA" -> "ZEMIN A"), so PaddleOCR gets `light_fix`: non-Latin characters dropped, stray lowercase in all-caps lettering upper-cased, lone marks at the ends trimmed.
+- The Tesseract notes below describe the fallback path.
 - OCR runs in the background, in parallel (one worker per core, capped), while the user starts reading. The scanner stays ahead of the reader.
 - Tesseract page segmentation mode 11 (sparse text).
 - Use line-level results, then merge lines into bubbles: sort by y, join a line to a group if the vertical gap is under about 1.3x line height and it overlaps the group horizontally by at least 30%.
@@ -109,7 +113,7 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
   - `?` read as trailing `Z`/`2` (THATZ -> THAT?) when the rest is a common/4+ letter word or ends the bubble (keeps names like LUAZ);
   - digits in words (T0, S0, 7O), lone 1/T/l/| -> I, `|` touching a letter -> I, I glued to a word (INOW -> I NOW);
   - mostly-caps bubbles are fully uppercased (strict typing shouldn't make you type OCR's stray lowercase).
-- Ads/credits: a bubble with scanlator/site text is always dropped (watermarks like FLAMESCANS.ORG sit inside story pages); non-watermark ad/credit text on the first/last two page images drops that whole page.
+- Ads/credits: a bubble with scanlator/site text is always dropped (watermarks like FLAMESCANS.ORG sit inside story pages); non-watermark ad/credit text on the first/last two page images drops the rest of that image toward the chapter's edge (above it at the start, below it at the end, with a 300 px margin). Dropping the whole image lost Star-Embracing Swordmaster ch 1's last 4 lines, which share the final tall image with the "READ AT ASURASCANS.COM" banner.
 - Priority series (user, 2026-11-23): **Absolute Sword Sense** (Asura Scans) and **Star-Embracing Swordmaster** (ManhuaTop; ch 1-15 from FlameScans). Measured non-dictionary words before -> after correction: ASS ch1 8.2% -> 4.0%, ch2 8.3% -> 3.1%; SES ch1 3.9% -> 3.1%, ch130 3.7% -> 3.4%. What remains is mostly character names. Asura lettering is the hard one (D/P, U/L, U read as LI/LU).
 - Known left: `50` for SO and `5` for IS as separate tokens, occasional dropped words, PAY vs DAY ambiguity in D/P fonts.
 - Reading order: top to bottom, ties left to right.
@@ -117,12 +121,26 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
 - Rendering all bands of a 150,000 px chapter takes ~2 s (small page cache per worker; dev builds use opt-level 1 because generic image code is ~10x slower unoptimized).
 - Cache results as JSON next to each chapter (bubble boxes, text, edits). Re-opening a chapter skips the scan.
 
+## What gets typed (`src/kinds.rs`, user's choice 2026-11-25 from examples A-G)
+- Keep: speech bubbles (white, black, grey), narration and captions (over the art, in boxes, glowing).
+- Drop: sound effects, game/status windows, small handwritten side chatter on the art, credits/logos (with the ads).
+- Runs on every load (rule changes need no rescan); bubbles the user edited are always kept. `manga-type ocr <chapter>` lists what was dropped and why.
+- Game windows by shape (a plain background doesn't separate them from speech): stat line (STRENGTH/LUCK/... + number), grade + number in <= 6 words, short label (<= 4 words with GRADE/RANK/RATING/TENDENCY/... as a whole word), "(... GRADE)"/"(... RANK)", mixed-case title ("Class", "Status"), system phrasing ("INCREASES BY", "ACQUIRES ALL", "YOU'VE OPENED").
+- Sound effects: 1-2 words, not ending like a sentence (".", "?", "...", ","; "?!" counts as speech), with a word that's not English, an interjection, an honorific (NIM, SSI, OPPA...) or a name from the chapter's longer lines; stretched words ("KYAAAAAK") off a plain background.
+- Side chatter: in a chapter lettered in caps, mixed-case text off a plain background. When it's merged with caps speech ("HERE, HAVE SOME. Hehe"), only the mixed-case words are removed.
+- `Bubble::framed` (measured at scan time, PaddleOCR path): share of pixels in a thin ring around each text line within 25 grey levels of the ring's median, averaged over lines; >= 0.85 counts as a plain bubble/box.
+- Checked over all 14 chapters (2026-11-25): 92 game-window lines, 26 sound effects, 19 side-chatter items dropped; no speech in the dropped list after the fixes.
+
 ## Persistence
 - Local library folder (configurable).
 - Per chapter: OCR cache JSON, last reading position, stats.
   - `<chapter>.manga-type-progress.json` (`library::ChapterProgress`): current bubble, done/skipped marks, finished flag, chapter totals (correct, wrong, active seconds). Saved after every bubble and when leaving the reader. Not written if you open and close a chapter without typing.
   - Reopening resumes at the bubble start (not mid-bubble). A finished chapter ("Read again") starts from the first bubble.
-- Settings (`~/.config/manga-type/settings.json`, settings dialog in the library): case, strictness, library path, sync mode, OCR worker count (0 = auto).
+- Settings (`~/.config/manga-type/settings.json`, settings dialog in the library): case, strictness, library path, sync mode, OCR worker count (0 = auto: the physical cores from Linux CPU topology, else half the threads, at most 16; past the physical cores workers only cost CPU: Regressor ch 2 on 24 threads took 27.0 s at 6 workers, 21.5 s at 12, 20.0 s at 22 with 4x the CPU time and 4 GB).
+- Time spent per chapter (`ChapterProgress::reading_seconds`): time with the chapter open while active; a gap between inputs counts at most 60 s. Shown per chapter, per series (list + header) and in the reader bar.
+- Session log `~/.local/share/manga-type/sessions.jsonl` (`history.rs`): one line per chapter visit (time, typing totals, bubbles, finished).
+- Per-key stats (`Stats::keys`, `Stats::typos`): hits/misses per expected character and "wanted→pressed" counts, recorded from 2026-11-25 on.
+- Stats page (library "Stats" button, or `manga-type stats`): totals, time per day (last 14 days), WPM per finished chapter, per series table, misses by kind of key, worst keys, most common typos.
 
 ## Stats
 - Live WPM (5 chars = 1 word) and accuracy (correct keystrokes / total keystrokes), per bubble and per chapter. Store per-chapter totals.

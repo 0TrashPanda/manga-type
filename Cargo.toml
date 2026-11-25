@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tract-onnx = "0.23"
 adb_client = { version = "4.0.0", default-features = false, features = ["usb"] }
 eframe = "0.37.0"
 flate2 = "1.1.11"
