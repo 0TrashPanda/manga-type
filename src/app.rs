@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::library::{Library, LocalChapter, Mark, format_duration};
+use crate::library::{Library, LocalChapter, Mark, format_duration, words_label};
 use crate::pages::Chapter;
 use crate::phone::{self, Series};
 use crate::reader::{self, Reader};
@@ -298,7 +298,9 @@ impl App {
                     &{
                         let t = s.reading_seconds();
                         let time = if t >= 1.0 { format!(" · {}", format_duration(t)) } else { String::new() };
-                        format!("{} · {} chapters · {} finished{time}", s.source, s.chapters.len(), s.finished_count())
+                        let (w, approx) = s.words();
+                        let words = if w > 0 { format!(" · {}", words_label(w, approx)) } else { String::new() };
+                        format!("{} · {} chapters · {} finished{time}{words}", s.source, s.chapters.len(), s.finished_count())
                     },
                     0.0,
                     egui::TextFormat::simple(egui::FontId::proportional(12.0), DIM),
@@ -335,6 +337,8 @@ impl App {
                 ui.heading(RichText::new(&s.title).strong());
                 let t = s.reading_seconds();
                 let spent = if t >= 1.0 { format!(" · {} spent", format_duration(t)) } else { String::new() };
+                let (w, approx) = s.words();
+                let spent = if w > 0 { format!("{spent} · {} typed", words_label(w, approx)) } else { spent };
                 ui.label(RichText::new(format!("{}{spent}", s.source)).color(DIM));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -733,7 +737,12 @@ fn mark_style(m: Mark) -> (&'static str, Color32, &'static str) {
 
 fn progress_text(c: &LocalChapter) -> String {
     let time = |p: &crate::library::ChapterProgress| {
-        if p.reading_seconds >= 1.0 { format!(" · {}", format_duration(p.reading_seconds)) } else { String::new() }
+        let mut s = if p.reading_seconds >= 1.0 { format!(" · {}", format_duration(p.reading_seconds)) } else { String::new() };
+        let (w, approx) = p.stats.word_count();
+        if w > 0 {
+            s.push_str(&format!(" · {}", words_label(w, approx)));
+        }
+        s
     };
     match &c.progress {
         Some(p) if p.finished => format!("finished · {:.0} WPM · {:.0}%{}", p.stats.wpm(), p.stats.accuracy(), time(p)),

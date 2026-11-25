@@ -84,6 +84,7 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
 - Scrolling setting (2026-11-24, user's choice), **default: manual**. Typing never moves the page.
   - Arrows, Page Up/Down, mouse wheel always scroll. j / k / Space (step: page, half, quarter; setting) and Shift+Space keep scrolling until you type the first letter of the current bubble (with the bubble on screen); from then until the bubble is done they type. If the bubble really starts with j or k, that key starts typing. Typing is blocked while the bubble is off screen (its text is dimmed with a hint).
 - You can't scroll past the bubble you're on: its top sticks to the top of the window until it's typed or skipped.
+- While typing a bubble (first letter typed), the scroll keys only work with Ctrl held (Ctrl + Up/Down, J/K, Page Up/Down); Shift+Space is just a space. The mouse wheel / touchpad always scroll (user's choice). Fixes the page jumping when Shift was still held on Space.
 - Zoom: Ctrl + / Ctrl - / Ctrl 0 (reset) and Ctrl + mouse wheel zoom the page (30-400%, saved as `zoom`), keeping the middle of the view in place. Left / Right pan when zoomed wider than the window. egui's own interface zoom is turned off.
   - "Follow typing" keeps the original mechanics below, plus: a bubble is first brought on screen (bottom at 85% of the view) before typing it.
 - Pages stacked vertically in one scroll area, user input scrolling disabled. Only typing moves it.
@@ -139,6 +140,7 @@ Native desktop app. Read manhua/manga/webtoons copied from a Mihon library, but 
 - Settings (`~/.config/manga-type/settings.json`, settings dialog in the library): case, strictness, library path, sync mode, OCR worker count (0 = auto: the physical cores from Linux CPU topology, else half the threads, at most 16; past the physical cores workers only cost CPU: Regressor ch 2 on 24 threads took 27.0 s at 6 workers, 21.5 s at 12, 20.0 s at 22 with 4x the CPU time and 4 GB).
 - Time spent per chapter (`ChapterProgress::reading_seconds`): time with the chapter open while active; a gap between inputs counts at most 60 s. Shown per chapter, per series (list + header) and in the reader bar.
 - Session log `~/.local/share/manga-type/sessions.jsonl` (`history.rs`): one line per chapter visit (time, typing totals, bubbles, finished).
+- Words typed (`Stats::words`): words in bubbles typed to the end, counted from 2026-11-25; older chapters show an estimate (characters / 5, marked "~"). Shown per chapter and series in the library and on the stats page (tile, per series, per chapter chart).
 - Per-key stats (`Stats::keys`, `Stats::typos`): hits/misses per expected character and "wanted→pressed" counts, recorded from 2026-11-25 on.
 - Stats page (library "Stats" button, or `manga-type stats`): totals, time per day (last 14 days), WPM per finished chapter, per series table, misses by kind of key, worst keys, most common typos.
 

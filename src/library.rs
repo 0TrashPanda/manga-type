@@ -50,6 +50,24 @@ pub struct ChapterProgress {
     pub updated: u64,
 }
 
+/// "4,120".
+pub fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// "412 words", "~4,120 words" (estimated from characters for older chapters).
+pub fn words_label(words: u64, approx: bool) -> String {
+    format!("{}{} words", if approx { "~" } else { "" }, thousands(words))
+}
+
 /// "45s", "12m", "1h 05m".
 pub fn format_duration(secs: f64) -> String {
     let s = secs.max(0.0).round() as u64;
@@ -177,6 +195,11 @@ pub struct LocalSeries {
 impl LocalSeries {
     pub fn phone_series(&self) -> phone::Series {
         phone::Series { source: self.source.clone(), title: self.title.clone() }
+    }
+
+    /// Words typed in this series, and whether any chapter's count is an estimate.
+    pub fn words(&self) -> (u64, bool) {
+        self.chapters.iter().filter_map(|c| c.progress.as_ref()).map(|p| p.stats.word_count()).fold((0, false), |a, (w, e)| (a.0 + w, a.1 || e))
     }
 
     /// Time spent reading this series (all chapters).
@@ -411,4 +434,19 @@ mod tests {
         assert_eq!(lib.next_after(&s.chapters[2].path), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    #[test]
+    fn word_labels() {
+        assert_eq!(thousands(7), "7");
+        assert_eq!(thousands(4120), "4,120");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+        assert_eq!(words_label(412, false), "412 words");
+        assert_eq!(words_label(4120, true), "~4,120 words");
+        let mut s = Stats::default();
+        s.correct = 500;
+        assert_eq!(s.word_count(), (100, true));
+        s.words = 93;
+        assert_eq!(s.word_count(), (93, false));
+    }
+
 }

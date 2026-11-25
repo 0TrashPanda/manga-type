@@ -421,6 +421,10 @@ impl Reader {
         self.start_scroll = self.end_for(self.current);
         if let Some(t) = &self.typing {
             self.bubble_stats.uncorrected += t.uncorrected();
+            if state == State::Done {
+                let text: String = t.chars.iter().collect();
+                self.bubble_stats.words += text.split_whitespace().filter(|w| w.chars().any(char::is_alphanumeric)).count() as u64;
+            }
         }
         self.chapter_stats.merge(&self.bubble_stats);
         self.bubble_stats = Stats::default();
@@ -507,6 +511,7 @@ impl Reader {
     /// when it's wider than the window. Saved as a setting.
     fn handle_zoom_keys(&mut self, ctx: &egui::Context) {
         use egui::KeyboardShortcut as K;
+        let locked = self.scroll_locked();
         let before = self.settings.zoom;
         let mut zoom = before;
         ctx.input_mut(|i| {
@@ -523,10 +528,11 @@ impl Reader {
             }
             // Ctrl + wheel (and touchpad pinch).
             zoom *= i.zoom_delta();
-            if i.key_pressed(Key::ArrowLeft) {
+            let pan = !locked || i.modifiers.command;
+            if pan && i.key_pressed(Key::ArrowLeft) {
                 self.pan_x += 80.0;
             }
-            if i.key_pressed(Key::ArrowRight) {
+            if pan && i.key_pressed(Key::ArrowRight) {
                 self.pan_x -= 80.0;
             }
         });
@@ -562,6 +568,13 @@ impl Reader {
 
     /// Scrolling that works in every state (manual mode): wheel, arrows, Page Up/Down,
     /// Shift+Space, and at the end of the chapter also j / k / Space.
+    /// While typing a bubble (manual scrolling), the scroll keys only work with Ctrl held, so
+    /// Shift+Space or an arrow key in the middle of a sentence can't make the page jump.
+    /// The mouse wheel and touchpad always scroll (the user's choice).
+    fn scroll_locked(&self) -> bool {
+        self.settings.scroll == ScrollMode::Manual && self.keys_type()
+    }
+
     fn handle_scroll_keys(&mut self, ctx: &egui::Context) {
         if self.settings.scroll != ScrollMode::Manual {
             return;
@@ -569,6 +582,7 @@ impl Reader {
         let line = LINE_STEP * self.view_h;
         let page = 0.9 * self.view_h;
         let space = self.settings.space_step.fraction() * self.view_h;
+        let locked = self.scroll_locked();
         let wheel = ctx.input(|i| i.smooth_scroll_delta.y);
         if wheel != 0.0 {
             self.scroll_by(-wheel / self.scale.max(0.01));
@@ -579,6 +593,17 @@ impl Reader {
         let events = ctx.input(|i| i.events.clone());
         for ev in &events {
             match ev {
+                egui::Event::Key { key, pressed: true, modifiers, .. } if locked => {
+                    if modifiers.command {
+                        match key {
+                            Key::ArrowDown | Key::J => self.scroll_by(line),
+                            Key::ArrowUp | Key::K => self.scroll_by(-line),
+                            Key::PageDown => self.scroll_by(page),
+                            Key::PageUp => self.scroll_by(-page),
+                            _ => {}
+                        }
+                    }
+                }
                 egui::Event::Key { key, pressed: true, modifiers, .. } => match key {
                     Key::ArrowDown => self.scroll_by(line),
                     Key::ArrowUp => self.scroll_by(-line),
@@ -607,8 +632,9 @@ impl Reader {
         let on_screen = self.current_placement().is_none_or(|p| p == std::cmp::Ordering::Equal);
         for ev in events {
             match ev {
-                // Shift+Space scrolls up in manual mode (handle_scroll_keys); don't type it.
-                egui::Event::Text(text) if !(manual && shift && text == " ") => {
+                // Shift+Space scrolls up in manual mode (handle_scroll_keys) until you start
+                // typing the bubble; from then on it's just a space.
+                egui::Event::Text(text) if !(manual && shift && text == " " && !self.typing_started) => {
                     for c in text.chars() {
                         let scroll_key = matches!(c, 'j' | 'k' | ' ');
                         if manual && !self.typing_started {
@@ -825,6 +851,9 @@ impl Reader {
                         ui.label(
                             egui::RichText::new("Type the first letter to start · until then j / k / Space scroll").color(DIM_TEXT),
                         );
+                    }
+                    Some(_) if self.scroll_locked() => {
+                        ui.label(egui::RichText::new("Typing: keys scroll with Ctrl (Ctrl + ↑ / ↓, J / K, Page Up / Down) · wheel always").color(DIM_TEXT));
                     }
                     _ => {}
                 }

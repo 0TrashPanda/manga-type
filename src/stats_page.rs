@@ -5,7 +5,7 @@
 use eframe::egui::{self, Color32, RichText, Stroke};
 
 use crate::history::{self, Session};
-use crate::library::{Library, format_duration};
+use crate::library::{Library, format_duration, thousands, words_label};
 use crate::typing::{KeyCount, Stats};
 
 const DIM: Color32 = Color32::from_gray(140);
@@ -20,10 +20,15 @@ struct SeriesRow {
     finished: usize,
     reading: f64,
     stats: Stats,
+    words: (u64, bool),
 }
 
 pub struct StatsPage {
     total: Stats,
+    /// Words typed, and whether part of it is estimated (chapters from before word counts).
+    words: (u64, bool),
+    /// (chapter label, words) for every chapter with typing, in the order last read.
+    words_per_chapter: Vec<(String, f32, String)>,
     reading: f64,
     finished: usize,
     started: usize,
@@ -52,11 +57,17 @@ impl StatsPage {
         let (mut reading, mut finished, mut started, mut typed_bubbles, mut skipped_bubbles) = (0.0, 0, 0, 0, 0);
         let mut series = Vec::new();
         let mut done_chapters: Vec<(u64, String, f32, f32)> = Vec::new();
+        let mut chapter_words: Vec<(u64, String, u64, bool)> = Vec::new();
         for s in &lib.series {
-            let mut row = SeriesRow { title: s.title.clone(), chapters: s.chapters.len(), finished: 0, reading: 0.0, stats: Stats::default() };
+            let mut row = SeriesRow { title: s.title.clone(), chapters: s.chapters.len(), finished: 0, reading: 0.0, stats: Stats::default(), words: (0, false) };
             for c in &s.chapters {
                 let Some(p) = &c.progress else { continue };
                 started += 1;
+                let (w, approx) = p.stats.word_count();
+                row.words = (row.words.0 + w, row.words.1 || approx);
+                if w > 0 {
+                    chapter_words.push((p.updated, format!("{} {}", short_title(&s.title), chapter_no(&c.display_name)), w, approx));
+                }
                 row.reading += p.reading_seconds;
                 row.stats.merge(&p.stats);
                 typed_bubbles += p.states.chars().filter(|&c| c == 'd').count();
@@ -72,6 +83,12 @@ impl StatsPage {
             series.push(row);
         }
         series.sort_by(|a, b| b.reading.total_cmp(&a.reading));
+        let words = series.iter().fold((0, false), |a, s| (a.0 + s.words.0, a.1 || s.words.1));
+        chapter_words.sort_by_key(|c| c.0);
+        let words_per_chapter = chapter_words
+            .into_iter()
+            .map(|(_, l, w, approx)| (l, w as f32, format!("{}{}", if approx { "~" } else { "" }, thousands(w))))
+            .collect();
         done_chapters.sort_by_key(|c| c.0);
         let trend = done_chapters.into_iter().map(|(_, l, w, a)| (l, w, a)).collect();
 
@@ -113,7 +130,7 @@ impl StatsPage {
         typos.truncate(15);
         let has_key_data = !total.keys.is_empty();
 
-        Self { total, reading, finished, started, typed_bubbles, skipped_bubbles, series, days, trend, worst_keys, groups, typos, has_key_data }
+        Self { total, words, words_per_chapter, reading, finished, started, typed_bubbles, skipped_bubbles, series, days, trend, worst_keys, groups, typos, has_key_data }
     }
 
     /// Draw the page. Returns true when the user wants to go back.
@@ -132,7 +149,7 @@ impl StatsPage {
             let tiles = [
                 ("Time spent", format_duration(self.reading)),
                 ("Typing time", format_duration(t.seconds)),
-                ("Words typed", format!("{:.0}", t.correct as f64 / 5.0)),
+                ("Words typed", format!("{}{}", if self.words.1 { "~" } else { "" }, thousands(self.words.0))),
                 ("Average WPM", format!("{:.0}", t.wpm())),
                 ("Accuracy", format!("{:.1}%", t.accuracy())),
                 ("Chapters finished", format!("{} / {}", self.finished, self.started)),
@@ -176,6 +193,16 @@ impl StatsPage {
                 columns(ui, &items, 120.0, GOOD);
             }
 
+            section(ui, "Words typed per chapter");
+            if self.words_per_chapter.is_empty() {
+                ui.label(RichText::new("Type a few bubbles to see this.").color(DIM));
+            } else {
+                columns(ui, &self.words_per_chapter, 120.0, ACCENT);
+                if self.words.1 {
+                    ui.label(RichText::new("~ = estimated from characters (chapters typed before word counting).").color(DIM).small());
+                }
+            }
+
             section(ui, "Per series");
             egui::Grid::new("per-series").striped(true).spacing([18.0, 6.0]).show(ui, |ui| {
                 for h in ["Series", "Finished", "Time spent", "WPM", "Accuracy", "Words"] {
@@ -188,7 +215,7 @@ impl StatsPage {
                     ui.label(format_duration(s.reading));
                     ui.label(format!("{:.0}", s.stats.wpm()));
                     ui.label(format!("{:.1}%", s.stats.accuracy()));
-                    ui.label(format!("{:.0}", s.stats.correct as f64 / 5.0));
+                    ui.label(words_label(s.words.0, s.words.1));
                     ui.end_row();
                 }
             });

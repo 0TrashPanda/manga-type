@@ -332,6 +332,10 @@ pub struct Stats {
     /// Wrong letters left in when a bubble ended ([`ErrorMode::Keep`]); each costs a word.
     #[serde(default)]
     pub uncorrected: u64,
+    /// Words in the bubbles typed to the end (from 2026-11-25; older stats only have
+    /// characters, see [`Stats::word_count`]).
+    #[serde(default)]
+    pub words: u64,
     /// Active typing time in seconds.
     pub seconds: f64,
     #[serde(skip)]
@@ -365,6 +369,12 @@ impl Stats {
         if correct { self.correct += 1 } else { self.wrong += 1 }
     }
 
+    /// Words typed, and whether that's an estimate (older stats without word counts:
+    /// 5 characters = 1 word).
+    pub fn word_count(&self) -> (u64, bool) {
+        if self.words == 0 && self.correct > 0 { (self.correct / 5, true) } else { (self.words, false) }
+    }
+
     /// Net words per minute: 5 correct characters = 1 word, minus one word for every
     /// wrong letter left in.
     pub fn wpm(&self) -> f64 {
@@ -386,6 +396,7 @@ impl Stats {
         self.correct += other.correct;
         self.wrong += other.wrong;
         self.uncorrected += other.uncorrected;
+        self.words += other.words;
         self.seconds += other.seconds;
         for (c, k) in &other.keys {
             let e = self.keys.entry(*c).or_default();
